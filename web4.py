@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify, send_file, redirect, Response, g
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 import yt_dlp
+from yt_dlp.utils import DownloadError, ExtractorError
 import os
 import traceback
 import threading
@@ -27,6 +29,9 @@ from openpyxl import Workbook, load_workbook
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024   # cover uploads etc.
+# Behind Render's proxy: trust X-Forwarded-For / -Proto so request.remote_addr and
+# request.is_secure are correct (needed for the Secure cookie flag and rate limiting).
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 CORS(app, supports_credentials=True)
 
 DOWNLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'MusicPlayer', 'downloads')
@@ -36,21 +41,60 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(COVER_FOLDER, exist_ok=True)
 os.makedirs(os.path.dirname(XLSX_PATH), exist_ok=True)
 
+
+def _persistent_secret(env_name, fname):
+    """Use the env var if set; otherwise generate a random secret once and keep it on disk.
+    (No hard-coded secrets in source.)  On hosts with an ephemeral disk (e.g. Render free tier)
+    set the env var, otherwise the secret changes on every restart and everyone is logged out."""
+    v = os.environ.get(env_name)
+    if v:
+        return v
+    p = os.path.join(os.path.dirname(XLSX_PATH), fname)
+    try:
+        if os.path.exists(p):
+            with open(p, 'r') as f:
+                s = f.read().strip()
+            if s:
+                return s
+        s = secrets.token_hex(32)
+        with open(p, 'w') as f:
+            f.write(s)
+        return s
+    except Exception:
+        return secrets.token_hex(32)
+
+
 # ---- auth / mail config ----
-CODE_PEPPER     = os.environ.get('SPOPUDAY_SECRET') or 'spopuday-local-secret'
+CODE_PEPPER     = _persistent_secret('SPOPUDAY_SECRET', '.pepper')
 MAIL_ENDPOINT   = 'https://flywheelacademy.org/uploads/mail3.php?tab=send'
-# NOTE: this PHP session id expires. If codes (signup / reset) stop arriving, grab a fresh
-#       PHPSESSID and set it:  set SPOPUDAY_MAIL_SESSID=xxxx   (better: use a real mail service)
-MAIL_PHPSESSID  = os.environ.get('SPOPUDAY_MAIL_SESSID', 'hoaeiudsjf9gnhbqf0d0qlk15n')
+# NOTE: this PHP session id expires. Set it via env:  set SPOPUDAY_MAIL_SESSID=xxxx
+#       (better: use a real mail service). No default is kept in source any more.
+MAIL_PHPSESSID  = os.environ.get('SPOPUDAY_MAIL_SESSID', '')
 MAIL_FROM       = 'spopuday@spot.com'
 MAIL_FROM_NAME  = 'noreply:spopuday'
 LEAK_DEV_CODE   = os.environ.get('SPOPUDAY_DEV_CODE', '0') == '1'   # OFF by default
 
 # ---- JWT ----
-# Put a long random value in the SPOPUDAY_JWT_SECRET env var for production.
-JWT_SECRET    = os.environ.get('SPOPUDAY_JWT_SECRET') or 'ricardo159447'
+JWT_SECRET    = _persistent_secret('SPOPUDAY_JWT_SECRET', '.jwt_secret')
 JWT_COOKIE    = 'SPOPUDAY_JWT'
 JWT_TTL       = 60 * 60 * 24 * 30
+
+# ---- yt-dlp behaviour ----
+# Optional: path to a Netscape-format cookies.txt exported from YOUR OWN browser.
+# Keep it private (never commit it). Cookies expire and may not help on datacenter IPs.
+YT_COOKIES = os.environ.get('SPOPUDAY_YT_COOKIES', '').strip()
+# Fetching full per-video metadata (tags/year) costs one extra YouTube request per video.
+# OFF by default so /api/related only uses search-result metadata. Set to 1 to re-enable.
+META_FETCH = os.environ.get('SPOPUDAY_META_FETCH', '0') == '1'
+
+
+def YDL(opts=None):
+    """Single place that builds every YoutubeDL instance (adds the optional cookie file)."""
+    o = dict(opts or {})
+    if YT_COOKIES and os.path.exists(YT_COOKIES):
+        o.setdefault('cookiefile', YT_COOKIES)
+    return yt_dlp.YoutubeDL(o)
+
 
 # ---- rate limiting ----
 RATE = {
@@ -80,8 +124,9 @@ def rate_limit(kind):
         @wraps(fn)
         def wrapper(*a, **k):
             rules = RATE.get(kind, {})
-            ip = request.headers.get('X-Forwarded-For', request.remote_addr or '') or 'unknown'
-            ip = ip.split(',')[0].strip()[:64]
+            # ProxyFix already resolved the real client address; don't trust a raw
+            # (spoofable) X-Forwarded-For header here.
+            ip = (request.remote_addr or 'unknown')[:64]
             if 'ip' in rules:
                 ok, wait = _rl_check('ip', ip, *rules['ip'])
                 if not ok:
@@ -99,6 +144,9 @@ def rate_limit(kind):
 
 # =====================================================================
 #  EXCEL "DATABASE"
+#  NOTE: the workbook lives in this process's memory. Run ONE worker process
+#  (e.g. gunicorn -w 1 --threads 8 app:app). With several workers each one keeps its
+#  own copy, so a user created in worker A is "not found" in worker B -> random 401s.
 # =====================================================================
 XLSX_LOCK = threading.RLock()
 
@@ -405,11 +453,13 @@ def issue_jwt(user_id):
 
 def set_jwt_cookie(resp, user_id):
     resp.set_cookie(JWT_COOKIE, issue_jwt(user_id), max_age=JWT_TTL,
-                    httponly=True, samesite='Lax', path='/')
+                    httponly=True, samesite='Lax', path='/',
+                    secure=request.is_secure)          # Secure on HTTPS (Render), plain on localhost
     return resp
 
 def clear_jwt_cookie(resp):
-    resp.set_cookie(JWT_COOKIE, '', max_age=0, httponly=True, samesite='Lax', path='/')
+    resp.set_cookie(JWT_COOKIE, '', max_age=0, httponly=True, samesite='Lax', path='/',
+                    secure=request.is_secure)
     return resp
 
 
@@ -1268,8 +1318,30 @@ function fmtDate(d){if(!d)return '';const x=new Date(String(d).replace(' ','T'))
 function tint(c){$('main').style.setProperty('--tint',c)}
 let tt;function toast(m,type){const t=$('toast');t.textContent=m;t.className='toast show '+(type||'');clearTimeout(tt);tt=setTimeout(()=>t.classList.remove('show'),3000)}
 
-async function loadLib(){try{const r=await fetch(API+'/library').then(r=>r.json());lib=r.downloads||[]}catch(e){console.error(e);lib=[]}}
-async function loadPlaylists(){try{const r=await fetch(API+'/playlists').then(r=>r.json());PL=r.playlists||[]}catch(e){PL=[]}}
+/* FIX: /api/library and /api/playlists require a logged-in user. Guests used to call them on
+   every page load, which produced the 401 responses. Only call them when signed in. If the
+   server still answers 401 (cookie expired / account gone), treat it as "signed out". */
+function sessionLost(){
+  if(!ME)return;
+  ME=null;applyMe();lib=[];PL=[];
+  toast('Your session expired — please log in again','error');
+}
+async function loadLib(){
+  if(!ME){lib=[];return}
+  try{
+    const resp=await fetch(API+'/library');
+    if(resp.status===401){sessionLost();lib=[];return}
+    const r=await resp.json();lib=r.downloads||[];
+  }catch(e){console.error(e);lib=[]}
+}
+async function loadPlaylists(){
+  if(!ME){PL=[];return}
+  try{
+    const resp=await fetch(API+'/playlists');
+    if(resp.status===401){sessionLost();PL=[];return}
+    const r=await resp.json();PL=r.playlists||[];
+  }catch(e){PL=[]}
+}
 
 function setChip(c){
   if(c==='all')c='liked';
@@ -1921,6 +1993,7 @@ if('mediaSession' in navigator){
   setVolUI();document.body.classList.add('is-paused');
   try{const me=await fetch(API+'/me').then(r=>r.json());if(me.user){ME=me.user;applyMe()}}catch(e){}
   // Guests are allowed in now (they get half-song previews); no forced login wall.
+  // loadLib/loadPlaylists are no-ops for guests, so no more 401s on page load.
   await loadLib();await loadPlaylists();
   renderSidebar();renderHome();
 
@@ -1962,7 +2035,7 @@ VID_RE = re.compile(r'(?:v=|youtu\.be/|/shorts/)([\w-]{11})')
 
 @app.before_request
 def load_session():
-    g.sid, g.user, g.dev, g.new_sid = None, None, '', False
+    g.sid, g.user, g.dev, g.new_sid, g.stale_cookie = None, None, '', False, False
     if not (request.path == '/' or request.path.startswith('/api/')):
         return
     g.dev = (request.headers.get('X-Device-Id') or '')[:64]
@@ -1972,13 +2045,30 @@ def load_session():
         payload = jwt_decode(tok)
         if payload and isinstance(payload.get('uid'), int):
             uid = payload['uid']
+        else:
+            g.stale_cookie = True          # bad signature / expired / secret changed
     if uid is not None:
         u = xl_find_one('users', id=uid)
         if u:
             g.user = {'id': u['id'], 'name': u['name'], 'email': u['email']}
             g.sid = 'jwt:' + str(uid)
+        else:
+            # Valid signature but the user row is gone (workbook wiped / not shared between
+            # workers). Do NOT trust the token for data access — ids restart at 1 and could
+            # collide with a different account. Log it and drop the cookie.
+            print(f'⚠️ JWT for uid={uid} is valid but no such user in the database '
+                  f'(ephemeral disk or multiple workers?)')
+            g.stale_cookie = True
     if g.sid is None:
         g.sid = 'anon:' + g.dev[:16]
+
+
+@app.after_request
+def drop_stale_cookie(resp):
+    # Clear a cookie that can never authenticate again, so the browser stops sending it.
+    if getattr(g, 'stale_cookie', False) and request.path != '/api/logout':
+        clear_jwt_cookie(resp)
+    return resp
 
 
 def needs_user(fn):
@@ -1992,7 +2082,9 @@ def needs_user(fn):
 
 @app.route('/api/me')
 def me():
-    return jsonify({'user': g.user, 'device_id': g.dev})
+    # 'session' tells the client why there is no user (helps debugging the 401s)
+    state = 'ok' if g.user else ('expired' if g.stale_cookie else 'guest')
+    return jsonify({'user': g.user, 'device_id': g.dev, 'session': state})
 
 
 @app.route('/api/signup', methods=['POST'])
@@ -2231,7 +2323,7 @@ def download():
                         'outtmpl': os.path.join(udir, f'{safe}.%(ext)s'),
                         'quiet': True, 'no_warnings': True, 'socket_timeout': 30,
                         'noplaylist': True, 'skip_unavailable_fragments': True}
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with YDL(opts) as ydl:
                     info = ydl.extract_info(url, download=True)
                     path = ydl.prepare_filename(info)
                 artist = info.get('artist') or info.get('uploader') or 'Unknown Artist'
@@ -2533,7 +2625,7 @@ def search():
                      'noplaylist': True, 'skip_unavailable_fragments': True,
                      'ignoreerrors': True, 'geo_bypass': True}
         if is_url:
-            with yt_dlp.YoutubeDL({**base_opts, 'extract_flat': False}) as ydl:
+            with YDL({**base_opts, 'extract_flat': False}) as ydl:
                 info = ydl.extract_info(query, download=False)
             if not info:
                 return jsonify({'error': 'Could not read that URL', 'results': []})
@@ -2553,11 +2645,11 @@ def search():
                 'thumbnail': thumb,
             }]})
         try:
-            with yt_dlp.YoutubeDL({**base_opts, 'extract_flat': 'in_playlist'}) as ydl:
+            with YDL({**base_opts, 'extract_flat': 'in_playlist'}) as ydl:
                 info = ydl.extract_info(f"ytsearch8:{query}", download=False)
         except Exception as e:
             print(f'   ytsearch failed ({e}); trying default_search')
-            with yt_dlp.YoutubeDL({**base_opts, 'extract_flat': True, 'default_search': 'ytsearch8'}) as ydl:
+            with YDL({**base_opts, 'extract_flat': True, 'default_search': 'ytsearch8'}) as ydl:
                 info = ydl.extract_info(query, download=False)
         entries = (info or {}).get('entries') or []
         results = []
@@ -2579,6 +2671,10 @@ def search():
         if not results:
             return jsonify({'error': 'No results found', 'results': []})
         return jsonify({'results': results})
+    except (DownloadError, ExtractorError) as e:
+        print(f'❌ search blocked/failed: {e}')
+        return jsonify({'error': 'YouTube did not return results (it may be rate-limiting this server). Try again shortly.',
+                        'results': []}), 502
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': f'Search failed: {e}', 'results': []})
@@ -2586,24 +2682,34 @@ def search():
 
 @app.route('/api/stream')
 def stream():
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({'error': 'Empty URL'}), 400
+    ydl_opts = {'format': 'bestaudio[ext=m4a]/bestaudio/best', 'quiet': True, 'no_warnings': True,
+                'socket_timeout': 30, 'noplaylist': True, 'skip_unavailable_fragments': True}
     try:
-        url = request.args.get('url', '').strip()
-        if not url:
-            return jsonify({'error': 'Empty URL'}), 400
-        ydl_opts = {'format': 'bestaudio[ext=m4a]/bestaudio/best', 'quiet': True, 'no_warnings': True,
-                    'socket_timeout': 30, 'noplaylist': True, 'skip_unavailable_fragments': True}
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with YDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            stream_url = info.get('url')
-            if not stream_url:
-                for fmt in reversed(info.get('formats', [])):
-                    if fmt.get('acodec') != 'none':
-                        stream_url = fmt.get('url')
-                        break
-            if not stream_url:
-                return jsonify({'error': 'Could not extract stream URL'}), 400
-            return redirect(stream_url)
+        if not info:
+            return jsonify({'error': 'Could not read that video'}), 502
+        stream_url = info.get('url')
+        if not stream_url:
+            for fmt in reversed(info.get('formats') or []):
+                if fmt.get('acodec') != 'none' and fmt.get('url'):
+                    stream_url = fmt.get('url')
+                    break
+        if not stream_url:
+            return jsonify({'error': 'Could not extract stream URL'}), 502
+        return redirect(stream_url)
+    except (DownloadError, ExtractorError) as e:
+        # Extraction failed upstream (bot check, geo-block, removed video, throttling...).
+        # Report it as a bad-gateway, not as a crash of this server.
+        msg = re.sub(r'\x1b\[[0-9;]*m', '', str(e))[:300]       # strip ANSI colour codes
+        print(f'❌ stream extraction failed: {msg}')
+        return jsonify({'error': 'YouTube refused to provide this stream (bot check, region block or rate limit).',
+                        'detail': msg}), 502
     except Exception as e:
+        traceback.print_exc()
         return jsonify({'error': f'Stream failed: {str(e)}'}), 500
 
 
@@ -2711,7 +2817,7 @@ def api_lyrics():
     try:
         opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True,
                 'socket_timeout': 25, 'skip_download': True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with YDL(opts) as ydl:
             info = ydl.extract_info(url, download=False) or {}
         lang, formats, manual = _pick_captions(info)
         if not formats:
@@ -2750,6 +2856,9 @@ def api_lyrics():
         if not clean:
             return jsonify({'error': 'No caption lines', 'lines': [], 'lang': lang})
         return jsonify({'lines': clean, 'lang': lang, 'source': 'manual' if manual else 'auto'})
+    except (DownloadError, ExtractorError) as e:
+        print(f'❌ lyrics extraction failed: {e}')
+        return jsonify({'error': 'Captions unavailable right now', 'lines': [], 'lang': None}), 502
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e), 'lines': [], 'lang': None})
@@ -2826,7 +2935,8 @@ def event():
               title=str(d.get('title') or '')[:200], artist=str(d.get('artist') or '')[:100],
               kind=kind, pct=pct, ts=time.time(), auto=1 if d.get('auto') else 0,
               score=float(d.get('score') or 0))
-    if kind in ('complete', 'replay', 'like', 'save'):
+    # Background metadata fetch costs an extra YouTube request, so it only runs if enabled.
+    if META_FETCH and kind in ('complete', 'replay', 'like', 'save'):
         threading.Thread(target=get_meta, args=(vid_, True), daemon=True).start()
     return jsonify({'ok': True, 'kind': kind})
 
@@ -2896,8 +3006,10 @@ _OPTS = {'quiet': True, 'no_warnings': True, 'socket_timeout': 30, 'extract_flat
 
 
 def _flat(url, **extra):
+    """Flat (list-only) extraction: ONE request that returns id/title/channel/duration for
+    every entry — it never opens the individual video pages."""
     try:
-        with yt_dlp.YoutubeDL({**_OPTS, **extra}) as ydl:
+        with YDL({**_OPTS, **extra}) as ydl:
             info = ydl.extract_info(url, download=False)
         return [e for e in ((info or {}).get('entries') or []) if e]
     except Exception as ex:
@@ -2917,6 +3029,10 @@ def _mk_meta(tags, year, channel, title, duration):
 
 
 def get_meta(vid_, fetch=False, entry=None):
+    """Metadata for a video.
+    Order: in-memory cache -> track_meta sheet -> (only if META_FETCH is enabled AND fetch=True)
+    a full yt-dlp extraction -> the lightweight search-result entry.
+    With the default settings this NEVER makes a network request."""
     if not vid_: return None
     if vid_ in _META: return _META[vid_]
     r = xl_find_one('track_meta', vid=vid_)
@@ -2926,10 +3042,10 @@ def get_meta(vid_, fetch=False, entry=None):
         m = _mk_meta(tags, r.get('year'), r.get('channel'), r.get('title'), r.get('duration'))
         _META[vid_] = m
         return m
-    if fetch:
+    if fetch and META_FETCH:
         try:
-            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'noplaylist': True,
-                                   'socket_timeout': 15, 'skip_download': True}) as ydl:
+            with YDL({'quiet': True, 'no_warnings': True, 'noplaylist': True,
+                      'socket_timeout': 15, 'skip_download': True}) as ydl:
                 raw = ydl.extract_info(f'https://www.youtube.com/watch?v={vid_}', download=False) or {}
         except Exception:
             raw = {}
@@ -3107,14 +3223,19 @@ def recommend_next(uid, sid, url, title, exclude, n=12):
             if radio: c['radio'] = max(c['radio'], max(0.0, (30 - i) / 30) * 0.7)
     top = [t for t in prof['top'] if t[0] != seed][:6]
     taste = random.sample(top, min(2, len(top)))
-    with ThreadPoolExecutor(10) as ex:
+
+    # Seed metadata comes from the cache / search-result info only — no per-video extraction.
+    seed_meta = (get_meta(seed, False) if seed else None) or _mk_meta([], None, '', title, 0)
+    artist = re.sub(r'(?i)\s*-\s*topic|vevo|official', '', seed_meta['channel']).strip()
+    if not artist and ' - ' in (title or ''):
+        artist = clean_title(title.split(' - ', 1)[0])[:60]      # "Artist - Song" titles
+    tags = [t for t in seed_meta['tags'] if len(t) < 25 and not (tokens(t) & seed_tok)][:3]
+
+    # A handful of FLAT list requests (each returns many candidates in one call).
+    with ThreadPoolExecutor(6) as ex:
         f_radio = ex.submit(_flat, f'https://www.youtube.com/watch?v={seed}&list=RD{seed}', playlistend=30) if seed else None
-        f_meta = ex.submit(get_meta, seed, True) if seed else None
         f_like = ex.submit(_flat, f'ytsearch12:songs like {base}', noplaylist=True)
         f_taste = [ex.submit(_flat, f'ytsearch8:songs like {clean_title(t)}', noplaylist=True) for _, t in taste]
-        seed_meta = (f_meta.result() if f_meta else None) or _mk_meta([], None, '', title, 0)
-        artist = re.sub(r'(?i)\s*-\s*topic|vevo|official', '', seed_meta['channel']).strip()
-        tags = [t for t in seed_meta['tags'] if len(t) < 25 and not (tokens(t) & seed_tok)][:3]
         f_artist = ex.submit(_flat, f'ytsearch10:{artist} songs', noplaylist=True) if artist else None
         f_tags = ex.submit(_flat, f'ytsearch10:{" ".join(tags)} songs', noplaylist=True) if tags else None
         if f_radio: add(f_radio.result(), 100, 2, 'radio', radio=True)
@@ -3146,13 +3267,11 @@ def recommend_next(uid, sid, url, title, exclude, n=12):
         c['score'] += 25 * (len(c['srcs']) - 1)
         pre.append(c)
     pre.sort(key=lambda c: c['score'], reverse=True)
-    pool = [c for c in pre if c['row'] is None][:14] + [c for c in pre if c['row'] is not None][:4]
-    with ThreadPoolExecutor(8) as ex:
-        metas = list(ex.map(lambda c: get_meta(c['v'], True, c['e']), pool))
-    for c, m in zip(pool, metas):
-        c['m'] = m
+    # (removed) the old thread-pool that called get_meta(..., fetch=True) on ~18 candidates —
+    # that was one full yt-dlp extraction per candidate per request. Now every candidate uses
+    # cached metadata or the lightweight search-result entry.
     for c in pre:
-        if 'm' not in c: c['m'] = get_meta(c['v'], False, c['e'])
+        c['m'] = get_meta(c['v'], False, c['e'])
         c['ch'] = c['m']['channel'] or c['e'].get('channel') or c['e'].get('uploader') or ''
         c['kind'] = 'familiar' if (c['row'] is not None or prof['aff'].get(c['v'], 0) > 0.5) else 'discovery'
         c['f'] = static_feats(c, cur, prof)
@@ -3253,6 +3372,9 @@ def related():
                 if r:
                     it.update({'id': r['id'], 'filename': r['filename'], 'thumbnail': r['thumbnail'] or it['thumbnail']})
         return jsonify({'results': res})
+    except (DownloadError, ExtractorError) as e:
+        print(f'❌ related blocked/failed: {e}')
+        return jsonify({'error': 'YouTube is rate-limiting this server', 'results': []}), 502
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e), 'results': []})
@@ -3267,6 +3389,8 @@ if __name__ == '__main__':
     print(f"💾 Excel DB: {XLSX_PATH}")
     print("🌐 Open: http://localhost:5000")
     print("💡 Dev code mode:", "ON" if LEAK_DEV_CODE else "OFF (set SPOPUDAY_DEV_CODE=1)")
+    print("🍪 YouTube cookies:", YT_COOKIES if (YT_COOKIES and os.path.exists(YT_COOKIES)) else "none")
+    print("🔎 Per-video metadata fetch:", "ON" if META_FETCH else "OFF (set SPOPUDAY_META_FETCH=1)")
     try:
         import socket
         _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); _s.connect(("8.8.8.8", 80))
