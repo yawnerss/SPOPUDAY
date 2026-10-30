@@ -30,7 +30,8 @@ class _QuietDDoSFilter(logging.Filter):
         return not any(c in msg for c in (' 429 ', ' 403 ', ' 404 '))
 
 logging.getLogger('werkzeug').addFilter(_QuietDDoSFilter())
-import yt_dlp
+from yt_dlp.utils import get_plugins_dir
+print('[DEBUG] Plugin directories:', get_plugins_dir())
 from yt_dlp.utils import DownloadError, ExtractorError
 import os
 import traceback
