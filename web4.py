@@ -32,6 +32,7 @@ class _QuietDDoSFilter(logging.Filter):
 logging.getLogger('werkzeug').addFilter(_QuietDDoSFilter())
 from yt_dlp.utils import get_plugins_dir
 print('[DEBUG] Plugin directories:', get_plugins_dir())
+import yt_dlp
 from yt_dlp.utils import DownloadError, ExtractorError
 import os
 import traceback
@@ -56,19 +57,33 @@ if os.path.isfile(DENO_PATH):
     print("[DEBUG] Deno version:", result.stdout)
 
 # ---- Deno JS Engine Auto-Discovery (for yt-dlp YouTube challenge solver) ----
+# ---- Deno JS Engine Auto-Discovery & Auto-Installer (for yt-dlp YouTube challenge solver) ----
 def get_deno_path():
     """Locate Deno runtime binary on Render (/opt/render/.deno/bin/deno) or local machine."""
+    """Locate Deno runtime binary on Render, Linux, Windows, or auto-install if missing."""
+    # 1. Environment variable override
     env_override = os.environ.get('DENO_PATH', '').strip()
     if env_override and os.path.isfile(env_override):
         return os.path.abspath(env_override)
 
+    # 2. Check current system PATH first
+    found = shutil.which('deno') or shutil.which('deno.exe')
+    if found and os.path.isfile(found):
+        return os.path.abspath(found)
+
+    # 3. Known Render and local candidates
     candidates = [
         '/opt/render/.deno/bin/deno',             # Render standard install path
         os.path.expanduser('~/.deno/bin/deno'),   # Linux home install
+        os.path.join(os.getcwd(), '.deno', 'bin', 'deno'),
+        '/opt/render/project/src/.deno/bin/deno',
+        '/opt/render/.deno/bin/deno',
+        os.path.expanduser('~/.deno/bin/deno'),
         '/root/.deno/bin/deno',
         '/usr/local/bin/deno',
         '/usr/bin/deno',
         os.path.expanduser('~/.deno/bin/deno.exe'), # Windows home install
+        os.path.expanduser('~/.deno/bin/deno.exe'),
         os.path.join(os.environ.get('APPDATA', ''), r'npm\node_modules\deno\deno.exe'),
         os.path.join(os.environ.get('USERPROFILE', ''), r'.deno\bin\deno.exe'),
         r'C:\Program Files\deno\deno.exe',
@@ -79,20 +94,50 @@ def get_deno_path():
     found = shutil.which('deno') or shutil.which('deno.exe')
     return os.path.abspath(found) if found else None
 
+    # 4. Auto-install Deno on Linux/Render if missing
+    if os.name == 'posix':
+        try:
+            print('[Deno] Deno not found in PATH or standard paths. Auto-installing...')
+            install_dir = os.path.expanduser('~/.deno')
+            env = os.environ.copy()
+            env['DENO_INSTALL'] = install_dir
+            res = subprocess.run(
+                'curl -fsSL https://deno.land/install.sh | sh',
+                shell=True,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            installed_bin = os.path.join(install_dir, 'bin', 'deno')
+            if os.path.isfile(installed_bin):
+                print(f'[Deno] Auto-installed successfully at {installed_bin}')
+                return os.path.abspath(installed_bin)
+            else:
+                print(f'[Deno] Auto-install script finished: {res.stdout[:150]} (code {res.returncode})')
+        except Exception as e:
+            print(f'[Deno] Auto-install failed: {e}')
+
+    return None
+
 def _setup_deno_runtime():
     deno_bin = get_deno_path()
     if deno_bin:
         deno_dir = os.path.dirname(deno_bin)
         curr_path = os.environ.get('PATH', '')
         if deno_dir not in curr_path:
+        if deno_dir not in curr_path.split(os.pathsep):
             os.environ['PATH'] = deno_dir + os.pathsep + curr_path
+        os.environ['DENO_PATH'] = deno_bin
         return deno_bin
     return None
 
 DENO_EXE = _setup_deno_runtime()
+DENO_PATH = DENO_EXE or ""
 
 def get_deno_info():
     deno_bin = get_deno_path()
+    deno_bin = DENO_PATH or get_deno_path()
     if deno_bin and os.path.isfile(deno_bin):
         try:
             import subprocess
@@ -102,6 +147,14 @@ def get_deno_info():
         except Exception:
             return {'available': True, 'path': deno_bin, 'version': 'deno (ready)'}
     return {'available': False, 'path': '', 'version': 'not found'}
+
+print(f"[DEBUG] Deno executable: {DENO_PATH or 'none'}")
+if DENO_PATH:
+    try:
+        _dver = subprocess.run([DENO_PATH, "--version"], capture_output=True, text=True, timeout=5)
+        print(f"[DEBUG] Deno version: {_dver.stdout.splitlines()[0] if _dver.stdout else 'ok'}")
+    except Exception:
+        pass
 import json
 import hashlib
 import math
@@ -125,6 +178,7 @@ if os.path.isfile(DENO_PATH):
         timeout=10
     )
     print("[DEBUG] Deno version:", result.stdout)
+
 import urllib.error
 from collections import defaultdict, Counter, deque
 from functools import wraps
@@ -319,9 +373,18 @@ def YDL(opts=None):
     yt = ext_args.setdefault('youtube', {})
     if 'skip' not in yt:
         yt['skip'] = ['authcheck']
+    # If a PO Token is configured via environment, supply it to yt-dlp
+    po_token = os.environ.get('YT_PO_TOKEN', '').strip() or os.environ.get('PO_TOKEN', '').strip()
+    if po_token and 'po_token' not in yt:
+        if '+' not in po_token:
+            po_token = f'web.gvs+{po_token}'
+        yt['po_token'] = [po_token]
+
     if 'player_client' not in yt:
         # Use yt-dlp's proven multi-client ladder for cloud/datacenter extractions
         yt['player_client'] = ['tv_samsung', 'web_embedded', 'web', 'mweb']
+        # tv_samsung, mweb, and tv support cookies and do NOT require GVS PO Tokens
+        yt['player_client'] = ['tv_samsung', 'mweb', 'tv', 'web_embedded', 'web']
 
     return yt_dlp.YoutubeDL(o)
 
@@ -5840,12 +5903,14 @@ def _pick_best_stream_url(info):
     if not info:
         return None
     if info.get('url') and info.get('acodec') != 'none':
+    if info.get('url') and info.get('acodec') and info.get('acodec') != 'none':
         return info.get('url')
     formats = info.get('formats') or []
     # Filter out storyboard sprites (sb0, sb1...) and formats without direct url
     valid = [f for f in formats if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
     # 1. Prefer audio-only streams (m4a or webm/opus)
     audio_only = [f for f in valid if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
+    audio_only = [f for f in valid if f.get('acodec') and f.get('acodec') != 'none' and (f.get('vcodec') == 'none' or not f.get('vcodec'))]
     if audio_only:
         m4a_audio = [f for f in audio_only if f.get('ext') == 'm4a']
         if m4a_audio:
@@ -5855,6 +5920,7 @@ def _pick_best_stream_url(info):
         return best_audio.get('url')
     # 2. Formats containing audio (e.g. video+audio MP4 or HLS)
     with_audio = [f for f in valid if f.get('acodec') != 'none']
+    with_audio = [f for f in valid if f.get('acodec') and f.get('acodec') != 'none']
     if with_audio:
         return with_audio[-1].get('url')
     if info.get('url'):
@@ -5872,6 +5938,7 @@ def stream():
     m = VID_RE.search(raw_url)
     video_id = m.group(1) if m else raw_url[:30]
 
+    deno_bin = DENO_PATH or get_deno_path()
     deno_info = get_deno_info()
     has_cookies = bool(get_yt_cookies_path())
     print(f'[Stream] Processing video: {video_id} | Deno: {deno_info.get("available")} ({deno_info.get("path") or "none"}) | Cookies: {has_cookies}')
@@ -5891,6 +5958,9 @@ def stream():
         'remote_components': ['ejs:npm'],
         'verbose': True,
     })
+    if deno_bin:
+        ydl_opts['js_runtimes'] = {'deno': {'path': deno_bin}}
+        ydl_opts['remote_components'] = ['ejs:npm']
 
     info = None
     stream_url = None
@@ -5912,17 +5982,23 @@ def stream():
             fmts = (info or {}).get('formats') or []
             has_url_count = sum(1 for f in fmts if f.get('url'))
             print(f'[Stream] {video_id} Tier 1: {len(fmts)} formats, {has_url_count} with direct URL, resolved={bool(stream_url)}')
+            direct_urls = [f for f in fmts if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
+            audio_formats = [f for f in direct_urls if f.get('acodec') and f.get('acodec') != 'none']
+            afmt_summary = [f"{f.get('format_id')}({f.get('ext')}/{f.get('acodec')})" for f in audio_formats[:4]]
+            print(f'[Stream] {video_id} Tier 1: {len(fmts)} formats, {len(direct_urls)} direct URLs, {len(audio_formats)} audio streams {afmt_summary}, resolved={bool(stream_url)}')
     except Exception as e:
         last_err = str(e)
         print(f'[Stream] Tier 1 extraction failed for {video_id}: {last_err[:200]}')
 
     # Tier 2: Resilient fallback targeting web_embedded & tv_samsung clients
+    # Tier 2: Resilient fallback targeting tv_samsung & mweb (bypasses GVS PO Token requirement on web_embedded)
     if not stream_url:
         try:
             fallback_opts = dict(ydl_opts)
             fallback_opts['extractor_args'] = {
                 'youtube': {
                     'player_client': ['web_embedded', 'tv_samsung', 'mweb'],
+                    'player_client': ['tv_samsung', 'mweb', 'tv'],
                     'skip': ['authcheck']
                 }
             }
@@ -5932,12 +6008,16 @@ def stream():
                 fmts2 = (fallback_info or {}).get('formats') or []
                 has_url_count2 = sum(1 for f in fmts2 if f.get('url'))
                 print(f'[Stream] {video_id} Tier 2: {len(fmts2)} formats, {has_url_count2} with direct URL, resolved={bool(stream_url)}')
+                direct_urls2 = [f for f in fmts2 if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
+                audio_formats2 = [f for f in direct_urls2 if f.get('acodec') and f.get('acodec') != 'none']
+                print(f'[Stream] {video_id} Tier 2: {len(fmts2)} formats, {len(audio_formats2)} audio streams, resolved={bool(stream_url)}')
         except Exception as e:
             last_err = str(e)
             print(f'[Stream] Tier 2 extraction failed for {video_id}: {last_err[:200]}')
 
     # Tier 3: Force itag 18 (360p MP4, combined audio+video) — immune to SABR URL withholding.
     # This client targets a different YouTube API path that always returns a direct URL.
+    # Tier 3: Force itag 18 (360p MP4, combined audio+video) — immune to SABR URL withholding
     if not stream_url:
         try:
             f18_opts = {
@@ -5949,6 +6029,10 @@ def stream():
                 'ignore_no_formats_error': True,
                 'extractor_args': {
                     'youtube': {'skip': ['authcheck']},
+                    'youtube': {
+                        'player_client': ['tv_samsung', 'mweb', 'android'],
+                        'skip': ['authcheck']
+                    },
                     'youtubetab': {'skip': ['authcheck']}
                 }
             }
@@ -5958,6 +6042,9 @@ def stream():
                 fmts3 = (f18_info or {}).get('formats') or []
                 has_url_count3 = sum(1 for f in fmts3 if f.get('url'))
                 print(f'[Stream] {video_id} Tier 3 (fmt 18): {len(fmts3)} formats, {has_url_count3} with direct URL, resolved={bool(stream_url)}')
+                direct_urls3 = [f for f in fmts3 if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
+                audio_formats3 = [f for f in direct_urls3 if f.get('acodec') and f.get('acodec') != 'none']
+                print(f'[Stream] {video_id} Tier 3 (fmt 18): {len(fmts3)} formats, {len(audio_formats3)} audio streams, resolved={bool(stream_url)}')
         except Exception as e:
             last_err = str(e)
             print(f'[Stream] Tier 3 extraction failed for {video_id}: {last_err[:200]}')
