@@ -173,17 +173,40 @@ JWT_TTL       = 60 * 60 * 24 * 30
 # ---- yt-dlp behaviour ----
 def get_yt_cookies_path():
     """Locate cookies.txt file for yt-dlp authentication."""
+    # 1. Environment variable pointing to a file path
     env_path = os.environ.get('SPOPUDAY_YT_COOKIES', '').strip()
     if env_path and os.path.isfile(env_path):
         return os.path.abspath(env_path)
-    # Automatically connect cookies.txt if present next to the server or in DATA_DIR
+
+    # 2. Render Secret Files & standard repository/data paths
     for candidate in [
-        os.path.join(DATA_DIR, 'cookies.txt'),
-        os.path.join(BASE_DIR, 'cookies.txt'),
-        os.path.abspath('cookies.txt')
+        '/etc/secrets/cookies.txt',               # Render.com Secret Files default location
+        os.path.join(DATA_DIR, 'cookies.txt'),   # Next to data / downloads
+        os.path.join(BASE_DIR, 'cookies.txt'),   # Root of GitHub repo (next to web12.py)
+        os.path.abspath('cookies.txt')           # Current working directory
     ]:
         if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
             return os.path.abspath(candidate)
+
+    # 3. Cloud Environment Variable with raw or base64 cookies (Render / Railway / Heroku)
+    raw_cookies = os.environ.get('YT_COOKIES_TEXT') or os.environ.get('YOUTUBE_COOKIES')
+    if raw_cookies:
+        try:
+            import base64
+            if raw_cookies.startswith('IyBOZXRzY2FwZ') or (' ' not in raw_cookies and len(raw_cookies) > 40):
+                try:
+                    decoded = base64.b64decode(raw_cookies).decode('utf-8', errors='ignore')
+                    if '# Netscape' in decoded:
+                        raw_cookies = decoded
+                except Exception:
+                    pass
+            target_path = os.path.join(DATA_DIR, 'cookies.txt')
+            with open(target_path, 'w', encoding='utf-8') as f:
+                f.write(raw_cookies)
+            return target_path
+        except Exception as e:
+            print(f'⚠️ Failed to write cookies from env: {e}')
+
     return ''
 
 YT_COOKIES = get_yt_cookies_path()
@@ -6584,4 +6607,5 @@ if __name__ == '__main__':
         pass
     print("=" * 50 + "\n")
     _debug = os.environ.get('SPOPUDAY_DEBUG', '0') == '1'
-    app.run(debug=_debug, host='0.0.0.0', port=5000, threaded=True)
+    _port = int(os.environ.get('PORT', 5000))
+    app.run(debug=_debug, host='0.0.0.0', port=_port, threaded=True)
