@@ -275,6 +275,9 @@ def YDL(opts=None):
 
     # 3. Safe format & playlist defaults
     o.setdefault('format', 'bestaudio/best')
+    # 'bestaudio/best/18' — itag 18 (360p MP4, combined audio+video) is immune to SABR
+    # and never withholds the direct URL, so it works as a last-resort audio source.
+    o.setdefault('format', 'bestaudio/best/18')
     o.setdefault('noplaylist', True)
     o.setdefault('ignore_no_formats_error', True)
 
@@ -5445,6 +5448,7 @@ def download():
                 safe = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip() \
                     or f'download_{int(time.time())}'
                 opts = {'format': 'bestaudio/best/ba*/b*',
+                opts = {'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best/18',
                         'outtmpl': os.path.join(udir, f'{safe}.%(ext)s'),
                         'quiet': True, 'no_warnings': True, 'socket_timeout': 30,
                         'noplaylist': True, 'skip_unavailable_fragments': True}
@@ -5845,6 +5849,7 @@ def stream():
 
     ydl_opts = {
         'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best/18',
         'quiet': True,
         'no_warnings': True,
         'socket_timeout': 30,
@@ -5862,6 +5867,9 @@ def stream():
         with YDL(ydl_opts) as ydl:
             info = ydl.extract_info(raw_url, download=False)
             stream_url = _pick_best_stream_url(info)
+            fmts = (info or {}).get('formats') or []
+            has_url_count = sum(1 for f in fmts if f.get('url'))
+            print(f'[Stream] {video_id} Tier 1: {len(fmts)} formats, {has_url_count} with direct URL, resolved={bool(stream_url)}')
     except Exception as e:
         last_err = str(e)
         print(f'[Stream] Tier 1 extraction failed for {video_id}: {last_err[:200]}')
@@ -5879,9 +5887,38 @@ def stream():
             with YDL(fallback_opts) as ydl:
                 fallback_info = ydl.extract_info(raw_url, download=False)
                 stream_url = _pick_best_stream_url(fallback_info)
+                fmts2 = (fallback_info or {}).get('formats') or []
+                has_url_count2 = sum(1 for f in fmts2 if f.get('url'))
+                print(f'[Stream] {video_id} Tier 2: {len(fmts2)} formats, {has_url_count2} with direct URL, resolved={bool(stream_url)}')
         except Exception as e:
             last_err = str(e)
             print(f'[Stream] Tier 2 extraction failed for {video_id}: {last_err[:200]}')
+
+    # Tier 3: Force itag 18 (360p MP4, combined audio+video) — immune to SABR URL withholding.
+    # This client targets a different YouTube API path that always returns a direct URL.
+    if not stream_url:
+        try:
+            f18_opts = {
+                'format': '18/bestaudio/best',
+                'quiet': True,
+                'no_warnings': True,
+                'socket_timeout': 20,
+                'noplaylist': True,
+                'ignore_no_formats_error': True,
+                'extractor_args': {
+                    'youtube': {'skip': ['authcheck']},
+                    'youtubetab': {'skip': ['authcheck']}
+                }
+            }
+            with YDL(f18_opts) as ydl:
+                f18_info = ydl.extract_info(raw_url, download=False)
+                stream_url = _pick_best_stream_url(f18_info)
+                fmts3 = (f18_info or {}).get('formats') or []
+                has_url_count3 = sum(1 for f in fmts3 if f.get('url'))
+                print(f'[Stream] {video_id} Tier 3 (fmt 18): {len(fmts3)} formats, {has_url_count3} with direct URL, resolved={bool(stream_url)}')
+        except Exception as e:
+            last_err = str(e)
+            print(f'[Stream] Tier 3 extraction failed for {video_id}: {last_err[:200]}')
 
     if stream_url:
         return redirect(stream_url)
@@ -6715,7 +6752,7 @@ if __name__ == '__main__':
         _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); _s.connect(("8.8.8.8", 80))
         print(f"📱 On your phone (same Wi-Fi): http://{_s.getsockname()[0]}:5000"); _s.close()
     except Exception:
-        pass
+        passx
     print("=" * 50 + "\n")
     _debug = os.environ.get('SPOPUDAY_DEBUG', '0') == '1'
     _port = int(os.environ.get('PORT', 5000))
