@@ -40,40 +40,51 @@ import secrets
 import shutil
 
 # ---- Deno JS Engine Auto-Discovery (for yt-dlp YouTube challenge solver) ----
-def _setup_deno_runtime():
-    home_dir = os.path.expanduser('~')
-    deno_candidates = [
-        os.path.join(home_dir, '.deno', 'bin'),
-        '/root/.deno/bin',
-        '/usr/local/bin',
-        '/usr/bin',
-        os.path.join(os.environ.get('APPDATA', ''), r'npm\node_modules\deno'),
-        os.path.join(os.environ.get('USERPROFILE', ''), r'.deno\bin'),
-        r'C:\Program Files\deno',
-        r'C:\ProgramData\chocolatey\bin'
+def get_deno_path():
+    """Locate Deno runtime binary on Render (/opt/render/.deno/bin/deno) or local machine."""
+    env_override = os.environ.get('DENO_PATH', '').strip()
+    if env_override and os.path.isfile(env_override):
+        return os.path.abspath(env_override)
+
+    candidates = [
+        '/opt/render/.deno/bin/deno',             # Render standard install path
+        os.path.expanduser('~/.deno/bin/deno'),   # Linux home install
+        '/root/.deno/bin/deno',
+        '/usr/local/bin/deno',
+        '/usr/bin/deno',
+        os.path.expanduser('~/.deno/bin/deno.exe'), # Windows home install
+        os.path.join(os.environ.get('APPDATA', ''), r'npm\node_modules\deno\deno.exe'),
+        os.path.join(os.environ.get('USERPROFILE', ''), r'.deno\bin\deno.exe'),
+        r'C:\Program Files\deno\deno.exe',
     ]
-    for dp in deno_candidates:
-        for name in ('deno', 'deno.exe'):
-            exe = os.path.join(dp, name)
-            if os.path.isfile(exe):
-                curr_path = os.environ.get('PATH', '')
-                if dp not in curr_path:
-                    os.environ['PATH'] = dp + os.pathsep + curr_path
-                return exe
-    return shutil.which('deno') or shutil.which('deno.exe')
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return os.path.abspath(c)
+    found = shutil.which('deno') or shutil.which('deno.exe')
+    return os.path.abspath(found) if found else None
+
+def _setup_deno_runtime():
+    deno_bin = get_deno_path()
+    if deno_bin:
+        deno_dir = os.path.dirname(deno_bin)
+        curr_path = os.environ.get('PATH', '')
+        if deno_dir not in curr_path:
+            os.environ['PATH'] = deno_dir + os.pathsep + curr_path
+        return deno_bin
+    return None
 
 DENO_EXE = _setup_deno_runtime()
 
 def get_deno_info():
-    exe = shutil.which('deno.exe') or shutil.which('deno')
-    if exe and os.path.isfile(exe):
+    deno_bin = get_deno_path()
+    if deno_bin and os.path.isfile(deno_bin):
         try:
             import subprocess
-            out = subprocess.check_output([exe, '--version'], text=True, timeout=2)
+            out = subprocess.check_output([deno_bin, '--version'], text=True, timeout=2)
             first_line = out.strip().splitlines()[0]
-            return {'available': True, 'path': exe, 'version': first_line}
+            return {'available': True, 'path': deno_bin, 'version': first_line}
         except Exception:
-            return {'available': True, 'path': exe, 'version': 'deno (ready)'}
+            return {'available': True, 'path': deno_bin, 'version': 'deno (ready)'}
     return {'available': False, 'path': '', 'version': 'not found'}
 import json
 import hashlib
@@ -177,42 +188,68 @@ JWT_COOKIE    = 'SPOPUDAY_JWT'
 JWT_TTL       = 60 * 60 * 24 * 30
 
 # ---- yt-dlp behaviour ----
-def get_yt_cookies_path():
-    """Locate cookies.txt file for yt-dlp authentication."""
-    # 1. Environment variable pointing to a file path
-    env_path = os.environ.get('SPOPUDAY_YT_COOKIES', '').strip()
-    if env_path and os.path.isfile(env_path):
-        return os.path.abspath(env_path)
+_COOKIE_CACHE_PATH = None
 
-    # 2. Render Secret Files & standard repository/data paths
-    for candidate in [
-        '/etc/secrets/cookies.txt',               # Render.com Secret Files default location
+def get_yt_cookies_path():
+    """Locate or prepare a writable cookies.txt file for yt-dlp authentication.
+
+    Render mounts Secret Files at /etc/secrets/cookies.txt as read-only.
+    Because yt-dlp automatically tries to save updated cookies back to cookiefile,
+    pointing directly to /etc/secrets/cookies.txt causes:
+    [Errno 30] Read-only file system: '/etc/secrets/cookies.txt'
+    This function creates a writable copy in tempfile.gettempdir() (/tmp/) so yt-dlp
+    can read and write cookies without error.
+    """
+    global _COOKIE_CACHE_PATH
+    if _COOKIE_CACHE_PATH and os.path.isfile(_COOKIE_CACHE_PATH) and os.path.getsize(_COOKIE_CACHE_PATH) > 0:
+        return _COOKIE_CACHE_PATH
+
+    # Check environment variable overrides first
+    env_path = (os.environ.get('YTDLP_COOKIE_FILE') or os.environ.get('SPOPUDAY_YT_COOKIES') or '').strip()
+
+    candidates = []
+    if env_path:
+        candidates.append(env_path)
+
+    candidates.extend([
+        '/etc/secrets/cookies.txt',               # Render.com Secret File default location
         os.path.join(DATA_DIR, 'cookies.txt'),   # Next to data / downloads
         os.path.join(BASE_DIR, 'cookies.txt'),   # Root of GitHub repo (next to web12.py)
         os.path.abspath('cookies.txt')           # Current working directory
-    ]:
-        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
-            return os.path.abspath(candidate)
+    ])
 
-    # 3. Cloud Environment Variable with raw or base64 cookies (Render / Railway / Heroku)
-    raw_cookies = os.environ.get('YT_COOKIES_TEXT') or os.environ.get('YOUTUBE_COOKIES')
-    if raw_cookies:
+    # Check raw cookies in environment variables
+    raw_env = os.environ.get('YT_COOKIES_TEXT') or os.environ.get('YOUTUBE_COOKIES')
+    if raw_env:
         try:
-            import base64
-            if raw_cookies.startswith('IyBOZXRzY2FwZ') or (' ' not in raw_cookies and len(raw_cookies) > 40):
-                try:
-                    decoded = base64.b64decode(raw_cookies).decode('utf-8', errors='ignore')
-                    if '# Netscape' in decoded:
-                        raw_cookies = decoded
-                except Exception:
-                    pass
-            target_path = os.path.join(DATA_DIR, 'cookies.txt')
-            with open(target_path, 'w', encoding='utf-8') as f:
-                f.write(raw_cookies)
-            return target_path
+            import tempfile
+            tmp_cookies = os.path.join(tempfile.gettempdir(), 'spopuday_cookies.txt')
+            with open(tmp_cookies, 'w', encoding='utf-8') as f:
+                f.write(raw_env)
+            _COOKIE_CACHE_PATH = tmp_cookies
+            return tmp_cookies
         except Exception as e:
-            print(f'⚠️ Failed to write cookies from env: {e}')
+            print(f'⚠️ Error writing cookies from environment variable: {e}')
 
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            try:
+                import tempfile
+                tmp_copy = os.path.join(tempfile.gettempdir(), 'yt_cookies.txt')
+                # If candidate is in /etc/secrets or on a read-only filesystem, copy to writable /tmp/
+                if candidate.startswith('/etc/secrets') or not os.access(candidate, os.W_OK) or os.path.abspath(candidate) != os.path.abspath(tmp_copy):
+                    shutil.copyfile(candidate, tmp_copy)
+                    try:
+                        os.chmod(tmp_copy, 0o600)
+                    except Exception:
+                        pass
+                    _COOKIE_CACHE_PATH = tmp_copy
+                    return tmp_copy
+                _COOKIE_CACHE_PATH = os.path.abspath(candidate)
+                return _COOKIE_CACHE_PATH
+            except Exception as ex:
+                print(f'⚠️ Warning copying cookies file {candidate}: {ex}')
+                return os.path.abspath(candidate)
     return ''
 
 YT_COOKIES = get_yt_cookies_path()
@@ -224,24 +261,35 @@ LYRICS_YT_FALLBACK = os.environ.get('SPOPUDAY_LYRICS_YT_FALLBACK', '0') == '1'
 
 def YDL(opts=None):
     o = dict(opts or {})
+
+    # 1. Writable cookiefile handling (fixes Errno 30 Read-only file system on Render)
     cpath = get_yt_cookies_path()
     if cpath:
         o.setdefault('cookiefile', cpath)
 
-    # Default to ignore_no_formats_error so yt-dlp returns raw formats without crashing
+    # 2. Configure Deno JS Runtime & yt-dlp-ejs remote components (solves YouTube JS challenges)
+    deno_bin = get_deno_path()
+    if deno_bin:
+        o.setdefault('js_runtimes', {'deno': {'path': deno_bin}})
+        o.setdefault('remote_components', ['ejs:npm'])
+
+    # 3. Safe format & playlist defaults
+    o.setdefault('format', 'bestaudio/best')
+    o.setdefault('noplaylist', True)
     o.setdefault('ignore_no_formats_error', True)
 
-    # Configure extractor_args: iOS client bypasses datacenter / Render IP blocks
     ext_args = o.setdefault('extractor_args', {})
     yt_tab = ext_args.setdefault('youtubetab', {})
     if 'skip' not in yt_tab:
         yt_tab['skip'] = ['authcheck']
+
     yt = ext_args.setdefault('youtube', {})
     if 'skip' not in yt:
         yt['skip'] = ['authcheck']
     if 'player_client' not in yt:
-        # 'ios' provides unthrottled audio streams on AWS / Render datacenter IPs
-        yt['player_client'] = ['ios', 'android', 'mweb', 'web']
+        # Use yt-dlp's proven multi-client ladder for cloud/datacenter extractions
+        yt['player_client'] = ['tv_samsung', 'web_embedded', 'web', 'mweb']
+
     return yt_dlp.YoutubeDL(o)
 
 
@@ -5783,51 +5831,83 @@ def _pick_best_stream_url(info):
 
 @app.route('/api/stream')
 def stream():
-    url = request.args.get('url', '').strip()
-    if not url:
-        return jsonify({'error': 'Empty URL'}), 400
+    raw_url = request.args.get('url', '').strip()
+    if not raw_url:
+        return jsonify({'error': 'Empty URL', 'detail': 'Missing url parameter'}), 400
+
+    # Extract video ID for clean, safe logging (never log full URL query params or secrets)
+    m = VID_RE.search(raw_url)
+    video_id = m.group(1) if m else raw_url[:30]
+
+    deno_info = get_deno_info()
+    has_cookies = bool(get_yt_cookies_path())
+    print(f'[Stream] Processing video: {video_id} | Deno: {deno_info.get("available")} ({deno_info.get("path") or "none"}) | Cookies: {has_cookies}')
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 30,
+        'noplaylist': True,
+        'skip_unavailable_fragments': True,
+        'ignore_no_formats_error': True
+    }
 
     info = None
     stream_url = None
+    last_err = None
 
-    # Attempt 1: Multi-client extraction with ignore_no_formats_error
+    # Tier 1: Primary extraction using configured YDL (Deno + yt-dlp-ejs + writable cookies + default clients)
     try:
-        with YDL({'format': 'bestaudio/best/ba*/b*', 'quiet': True, 'no_warnings': True,
-                  'socket_timeout': 25, 'noplaylist': True, 'skip_unavailable_fragments': True,
-                  'ignore_no_formats_error': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
+        with YDL(ydl_opts) as ydl:
+            info = ydl.extract_info(raw_url, download=False)
             stream_url = _pick_best_stream_url(info)
     except Exception as e:
-        print(f'   stream attempt 1 error: {e}')
+        last_err = str(e)
+        print(f'[Stream] Tier 1 extraction failed for {video_id}: {last_err[:200]}')
 
-    # Attempt 2: Explicit iOS player client (immune to Render/AWS datacenter IP blocks)
+    # Tier 2: Resilient fallback targeting web_embedded & tv_samsung clients
     if not stream_url:
         try:
-            with YDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 20, 'noplaylist': True,
-                      'ignore_no_formats_error': True,
-                      'extractor_args': {'youtube': {'player_client': ['ios'], 'skip': ['authcheck']}}}) as ydl:
-                ios_info = ydl.extract_info(url, download=False)
-                stream_url = _pick_best_stream_url(ios_info)
+            fallback_opts = dict(ydl_opts)
+            fallback_opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': ['web_embedded', 'tv_samsung', 'mweb'],
+                    'skip': ['authcheck']
+                }
+            }
+            with YDL(fallback_opts) as ydl:
+                fallback_info = ydl.extract_info(raw_url, download=False)
+                stream_url = _pick_best_stream_url(fallback_info)
         except Exception as e:
-            print(f'   stream attempt 2 (iOS) error: {e}')
-
-    # Attempt 3: Mobile web / Android fallback
-    if not stream_url:
-        try:
-            with YDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 20, 'noplaylist': True,
-                      'ignore_no_formats_error': True,
-                      'extractor_args': {'youtube': {'player_client': ['mweb', 'android'], 'skip': ['authcheck']}}}) as ydl:
-                m_info = ydl.extract_info(url, download=False)
-                stream_url = _pick_best_stream_url(m_info)
-        except Exception as e:
-            print(f'   stream attempt 3 (mweb) error: {e}')
+            last_err = str(e)
+            print(f'[Stream] Tier 2 extraction failed for {video_id}: {last_err[:200]}')
 
     if stream_url:
         return redirect(stream_url)
 
-    print(f'❌ stream extraction failed for: {url}')
-    return jsonify({'error': 'YouTube refused to provide this stream (bot check, region block or rate limit).',
-                    'detail': 'No playable audio formats found for this client/IP.'}), 502
+    # Diagnostic error reporting without exposing sensitive data
+    clean_err = re.sub(r'\x1b\[[0-9;]*m', '', str(last_err or 'No playable audio formats returned by YouTube'))[:300]
+    print(f'❌ [Stream] Extraction failed for {video_id}: {clean_err}')
+
+    if 'failed to extract any player response' in clean_err.lower():
+        hint = 'YouTube blocked or did not return a player response for this datacenter IP. Verify that Deno and valid cookies are active.'
+    elif 'requested format' in clean_err.lower():
+        hint = 'Requested audio format was not available for this track.'
+    elif 'read-only' in clean_err.lower():
+        hint = 'Cookie storage permission error.'
+    else:
+        hint = 'YouTube refused to provide this audio stream (rate limit or bot check).'
+
+    return jsonify({
+        'error': hint,
+        'video_id': video_id,
+        'detail': clean_err,
+        'runtime': {
+            'deno': deno_info.get('available'),
+            'cookies': has_cookies
+        }
+    }), 502
 
 
 def _allowed_img_host(host):
