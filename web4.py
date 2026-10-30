@@ -41,20 +41,26 @@ import shutil
 
 # ---- Deno JS Engine Auto-Discovery (for yt-dlp YouTube challenge solver) ----
 def _setup_deno_runtime():
+    home_dir = os.path.expanduser('~')
     deno_candidates = [
+        os.path.join(home_dir, '.deno', 'bin'),
+        '/root/.deno/bin',
+        '/usr/local/bin',
+        '/usr/bin',
         os.path.join(os.environ.get('APPDATA', ''), r'npm\node_modules\deno'),
         os.path.join(os.environ.get('USERPROFILE', ''), r'.deno\bin'),
         r'C:\Program Files\deno',
         r'C:\ProgramData\chocolatey\bin'
     ]
     for dp in deno_candidates:
-        exe = os.path.join(dp, 'deno.exe')
-        if os.path.isfile(exe):
-            curr_path = os.environ.get('PATH', '')
-            if dp not in curr_path:
-                os.environ['PATH'] = dp + os.pathsep + curr_path
-            return exe
-    return shutil.which('deno.exe') or shutil.which('deno')
+        for name in ('deno', 'deno.exe'):
+            exe = os.path.join(dp, name)
+            if os.path.isfile(exe):
+                curr_path = os.environ.get('PATH', '')
+                if dp not in curr_path:
+                    os.environ['PATH'] = dp + os.pathsep + curr_path
+                return exe
+    return shutil.which('deno') or shutil.which('deno.exe')
 
 DENO_EXE = _setup_deno_runtime()
 
@@ -222,7 +228,10 @@ def YDL(opts=None):
     if cpath:
         o.setdefault('cookiefile', cpath)
 
-    # Configure extractor_args so playlists and streams work smoothly with Deno solver
+    # Default to ignore_no_formats_error so yt-dlp returns raw formats without crashing
+    o.setdefault('ignore_no_formats_error', True)
+
+    # Configure extractor_args: iOS client bypasses datacenter / Render IP blocks
     ext_args = o.setdefault('extractor_args', {})
     yt_tab = ext_args.setdefault('youtubetab', {})
     if 'skip' not in yt_tab:
@@ -231,7 +240,8 @@ def YDL(opts=None):
     if 'skip' not in yt:
         yt['skip'] = ['authcheck']
     if 'player_client' not in yt:
-        yt['player_client'] = ['android', 'web']
+        # 'ios' provides unthrottled audio streams on AWS / Render datacenter IPs
+        yt['player_client'] = ['ios', 'android', 'mweb', 'web']
     return yt_dlp.YoutubeDL(o)
 
 
@@ -5751,7 +5761,10 @@ def _pick_best_stream_url(info):
     if info.get('url') and info.get('acodec') != 'none':
         return info.get('url')
     formats = info.get('formats') or []
-    audio_only = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url')]
+    # Filter out storyboard sprites (sb0, sb1...) and formats without direct url
+    valid = [f for f in formats if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
+    # 1. Prefer audio-only streams (m4a or webm/opus)
+    audio_only = [f for f in valid if f.get('acodec') != 'none' and f.get('vcodec') == 'none']
     if audio_only:
         m4a_audio = [f for f in audio_only if f.get('ext') == 'm4a']
         if m4a_audio:
@@ -5759,10 +5772,13 @@ def _pick_best_stream_url(info):
             return best_m4a.get('url')
         best_audio = max(audio_only, key=lambda f: f.get('abr') or f.get('tbr') or 0)
         return best_audio.get('url')
-    with_audio = [f for f in formats if f.get('acodec') != 'none' and f.get('url')]
+    # 2. Formats containing audio (e.g. video+audio MP4 or HLS)
+    with_audio = [f for f in valid if f.get('acodec') != 'none']
     if with_audio:
         return with_audio[-1].get('url')
-    return info.get('url')
+    if info.get('url'):
+        return info.get('url')
+    return None
 
 
 @app.route('/api/stream')
@@ -5770,33 +5786,48 @@ def stream():
     url = request.args.get('url', '').strip()
     if not url:
         return jsonify({'error': 'Empty URL'}), 400
-    ydl_opts = {'format': 'bestaudio/best/ba*/b*', 'quiet': True, 'no_warnings': True,
-                'socket_timeout': 30, 'noplaylist': True, 'skip_unavailable_fragments': True}
-    try:
-        try:
-            with YDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except (DownloadError, ExtractorError) as e:
-            if 'format is not available' in str(e).lower() or 'requested format' in str(e).lower():
-                with YDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 30, 'noplaylist': True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-            else:
-                raise
 
-        if not info:
-            return jsonify({'error': 'Could not read that video'}), 502
-        stream_url = _pick_best_stream_url(info)
-        if not stream_url:
-            return jsonify({'error': 'Could not extract stream URL'}), 502
-        return redirect(stream_url)
-    except (DownloadError, ExtractorError) as e:
-        msg = re.sub(r'\x1b\[[0-9;]*m', '', str(e))[:300]
-        print(f'❌ stream extraction failed: {msg}')
-        return jsonify({'error': 'YouTube refused to provide this stream (bot check, region block or rate limit).',
-                        'detail': msg}), 502
+    info = None
+    stream_url = None
+
+    # Attempt 1: Multi-client extraction with ignore_no_formats_error
+    try:
+        with YDL({'format': 'bestaudio/best/ba*/b*', 'quiet': True, 'no_warnings': True,
+                  'socket_timeout': 25, 'noplaylist': True, 'skip_unavailable_fragments': True,
+                  'ignore_no_formats_error': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_url = _pick_best_stream_url(info)
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({'error': f'Stream failed: {str(e)}'}), 500
+        print(f'   stream attempt 1 error: {e}')
+
+    # Attempt 2: Explicit iOS player client (immune to Render/AWS datacenter IP blocks)
+    if not stream_url:
+        try:
+            with YDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 20, 'noplaylist': True,
+                      'ignore_no_formats_error': True,
+                      'extractor_args': {'youtube': {'player_client': ['ios'], 'skip': ['authcheck']}}}) as ydl:
+                ios_info = ydl.extract_info(url, download=False)
+                stream_url = _pick_best_stream_url(ios_info)
+        except Exception as e:
+            print(f'   stream attempt 2 (iOS) error: {e}')
+
+    # Attempt 3: Mobile web / Android fallback
+    if not stream_url:
+        try:
+            with YDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 20, 'noplaylist': True,
+                      'ignore_no_formats_error': True,
+                      'extractor_args': {'youtube': {'player_client': ['mweb', 'android'], 'skip': ['authcheck']}}}) as ydl:
+                m_info = ydl.extract_info(url, download=False)
+                stream_url = _pick_best_stream_url(m_info)
+        except Exception as e:
+            print(f'   stream attempt 3 (mweb) error: {e}')
+
+    if stream_url:
+        return redirect(stream_url)
+
+    print(f'❌ stream extraction failed for: {url}')
+    return jsonify({'error': 'YouTube refused to provide this stream (bot check, region block or rate limit).',
+                    'detail': 'No playable audio formats found for this client/IP.'}), 502
 
 
 def _allowed_img_host(host):
