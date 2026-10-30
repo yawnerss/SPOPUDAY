@@ -284,9 +284,14 @@ def get_yt_cookies_path():
             try:
                 import tempfile
                 tmp_copy = os.path.join(tempfile.gettempdir(), 'yt_cookies.txt')
-                # If candidate is in /etc/secrets or on a read-only filesystem, copy to writable /tmp/
-                if candidate.startswith('/etc/secrets') or not os.access(candidate, os.W_OK) or os.path.abspath(candidate) != os.path.abspath(tmp_copy):
-                    shutil.copyfile(candidate, tmp_copy)
+                # Read candidate content and ensure standard Netscape header is present
+                with open(candidate, 'r', encoding='utf-8', errors='ignore') as cf:
+                    content = cf.read()
+                if content.strip():
+                    if not content.startswith('# Netscape HTTP Cookie File'):
+                        content = '# Netscape HTTP Cookie File\n# https://curl.se/docs/http-cookies.html\n\n' + content.lstrip()
+                    with open(tmp_copy, 'w', encoding='utf-8') as tf:
+                        tf.write(content)
                     try:
                         os.chmod(tmp_copy, 0o600)
                     except Exception:
@@ -322,8 +327,8 @@ def YDL(opts=None):
         o.setdefault('remote_components', ['ejs:npm'])
 
     # 3. Safe format & playlist defaults
-    # Restrict to YouTube extractors (50x faster init, prevents worker timeouts)
-    o.setdefault('allowed_extractors', ['youtube', 'youtubetab'])
+    # Restrict to YouTube extractors (50x faster init, supports videos, searches & playlists)
+    o.setdefault('allowed_extractors', ['(?i)youtube.*', 'generic'])
     # 'bestaudio/best/18' — itag 18 (360p MP4, combined audio+video) is immune to SABR
     # and never withholds the direct URL, so it works as a last-resort audio source.
     o.setdefault('format', 'bestaudio/best/18')
@@ -5930,7 +5935,7 @@ def stream():
         'noplaylist': True,
         'skip_unavailable_fragments': True,
         'ignore_no_formats_error': True,
-        'allowed_extractors': ['youtube', 'youtubetab'],
+        'allowed_extractors': ['(?i)youtube.*', 'generic'],
     }
     if deno_bin:
         ydl_opts['js_runtimes'] = {'deno': {'path': deno_bin}}
@@ -6448,7 +6453,7 @@ def sigmoid(x):
 
 
 _OPTS = {'quiet': True, 'no_warnings': True, 'socket_timeout': 15, 'extract_flat': 'in_playlist',
-         'ignoreerrors': True, 'geo_bypass': True, 'allowed_extractors': ['youtube', 'youtubetab']}
+         'ignoreerrors': True, 'geo_bypass': True, 'allowed_extractors': ['(?i)youtube.*', 'generic']}
 
 
 def _flat(url, **extra):
