@@ -39,6 +39,21 @@ import random
 import secrets
 import shutil
 
+import subprocess
+
+# Debug Deno detection (temporary)
+DENO_PATH = "/opt/render/.deno/bin/deno"
+print("[DEBUG] Deno exists:", os.path.isfile(DENO_PATH))
+print("[DEBUG] Deno executable:", shutil.which("deno"))
+if os.path.isfile(DENO_PATH):
+    result = subprocess.run(
+        [DENO_PATH, "--version"],
+        capture_output=True,
+        text=True,
+        timeout=10
+    )
+    print("[DEBUG] Deno version:", result.stdout)
+
 # ---- Deno JS Engine Auto-Discovery (for yt-dlp YouTube challenge solver) ----
 def get_deno_path():
     """Locate Deno runtime binary on Render (/opt/render/.deno/bin/deno) or local machine."""
@@ -94,6 +109,21 @@ import hmac
 import base64
 import sqlite3
 import shutil
+
+import subprocess
+
+# Debug Deno detection (temporary)
+DENO_PATH = "/opt/render/.deno/bin/deno"
+print("[DEBUG] Deno exists:", os.path.isfile(DENO_PATH))
+print("[DEBUG] Deno executable:", shutil.which("deno"))
+if os.path.isfile(DENO_PATH):
+    result = subprocess.run(
+        [DENO_PATH, "--version"],
+        capture_output=True,
+        text=True,
+        timeout=10
+    )
+    print("[DEBUG] Deno version:", result.stdout)
 import urllib.error
 from collections import defaultdict, Counter, deque
 from functools import wraps
@@ -5854,6 +5884,12 @@ def stream():
         'skip_unavailable_fragments': True,
         'ignore_no_formats_error': True
     }
+    # Debug: inject Deno runtime and verbose output for yt-dlp
+    ydl_opts.update({
+        'js_runtimes': {'deno': {'path': DENO_PATH}},
+        'remote_components': ['ejs:npm'],
+        'verbose': True,
+    })
 
     info = None
     stream_url = None
