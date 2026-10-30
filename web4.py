@@ -274,7 +274,6 @@ def YDL(opts=None):
         o.setdefault('remote_components', ['ejs:npm'])
 
     # 3. Safe format & playlist defaults
-    o.setdefault('format', 'bestaudio/best')
     # 'bestaudio/best/18' — itag 18 (360p MP4, combined audio+video) is immune to SABR
     # and never withholds the direct URL, so it works as a last-resort audio source.
     o.setdefault('format', 'bestaudio/best/18')
@@ -5447,7 +5446,6 @@ def download():
             try:
                 safe = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip() \
                     or f'download_{int(time.time())}'
-                opts = {'format': 'bestaudio/best/ba*/b*',
                 opts = {'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best/18',
                         'outtmpl': os.path.join(udir, f'{safe}.%(ext)s'),
                         'quiet': True, 'no_warnings': True, 'socket_timeout': 30,
@@ -5848,7 +5846,6 @@ def stream():
     print(f'[Stream] Processing video: {video_id} | Deno: {deno_info.get("available")} ({deno_info.get("path") or "none"}) | Cookies: {has_cookies}')
 
     ydl_opts = {
-        'format': 'bestaudio/best',
         'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best/18',
         'quiet': True,
         'no_warnings': True,
