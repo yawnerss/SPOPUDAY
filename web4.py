@@ -37,6 +37,38 @@ import traceback
 import threading
 import random
 import secrets
+import shutil
+
+# ---- Deno JS Engine Auto-Discovery (for yt-dlp YouTube challenge solver) ----
+def _setup_deno_runtime():
+    deno_candidates = [
+        os.path.join(os.environ.get('APPDATA', ''), r'npm\node_modules\deno'),
+        os.path.join(os.environ.get('USERPROFILE', ''), r'.deno\bin'),
+        r'C:\Program Files\deno',
+        r'C:\ProgramData\chocolatey\bin'
+    ]
+    for dp in deno_candidates:
+        exe = os.path.join(dp, 'deno.exe')
+        if os.path.isfile(exe):
+            curr_path = os.environ.get('PATH', '')
+            if dp not in curr_path:
+                os.environ['PATH'] = dp + os.pathsep + curr_path
+            return exe
+    return shutil.which('deno.exe') or shutil.which('deno')
+
+DENO_EXE = _setup_deno_runtime()
+
+def get_deno_info():
+    exe = shutil.which('deno.exe') or shutil.which('deno')
+    if exe and os.path.isfile(exe):
+        try:
+            import subprocess
+            out = subprocess.check_output([exe, '--version'], text=True, timeout=2)
+            first_line = out.strip().splitlines()[0]
+            return {'available': True, 'path': exe, 'version': first_line}
+        except Exception:
+            return {'available': True, 'path': exe, 'version': 'deno (ready)'}
+    return {'available': False, 'path': '', 'version': 'not found'}
 import json
 import hashlib
 import math
@@ -166,6 +198,17 @@ def YDL(opts=None):
     cpath = get_yt_cookies_path()
     if cpath:
         o.setdefault('cookiefile', cpath)
+
+    # Configure extractor_args so playlists and streams work smoothly with Deno solver
+    ext_args = o.setdefault('extractor_args', {})
+    yt_tab = ext_args.setdefault('youtubetab', {})
+    if 'skip' not in yt_tab:
+        yt_tab['skip'] = ['authcheck']
+    yt = ext_args.setdefault('youtube', {})
+    if 'skip' not in yt:
+        yt['skip'] = ['authcheck']
+    if 'player_client' not in yt:
+        yt['player_client'] = ['android', 'web']
     return yt_dlp.YoutubeDL(o)
 
 
@@ -4431,6 +4474,10 @@ def render_admin_page(client_ip):
           <div class="label">YouTube Cookies (yt-dlp)</div>
           <div class="val" id="profYtCookies" style="font-size:12px;">Checking...</div>
         </div>
+        <div class="profile-item">
+          <div class="label">Deno JS Engine (yt-dlp)</div>
+          <div class="val" id="profDeno" style="font-size:12px;">Checking...</div>
+        </div>
       </div>
     </div>
   </div>
@@ -4522,6 +4569,17 @@ async function loadAllData() {{
         }} else {{
           cElem.textContent = '⚪ Not Connected';
           cElem.style.color = '#888';
+        }}
+      }}
+
+      var dElem = document.getElementById('profDeno');
+      if (dElem) {{
+        if (ovRes.profile.deno_available) {{
+          dElem.textContent = '🟢 ' + (ovRes.profile.deno_version || 'Deno Active');
+          dElem.style.color = 'var(--green)';
+        }} else {{
+          dElem.textContent = '⚪ Built-in JS interpreter';
+          dElem.style.color = '#888';
         }}
       }}
 
@@ -4823,7 +4881,9 @@ def admin_overview():
             'xlsx_path': XLSX_PATH,
             'ban_db_path': BAN_DB_PATH,
             'yt_cookies': get_yt_cookies_path() or 'none',
-            'yt_cookies_name': os.path.basename(get_yt_cookies_path()) if get_yt_cookies_path() else ''
+            'yt_cookies_name': os.path.basename(get_yt_cookies_path()) if get_yt_cookies_path() else '',
+            'deno_available': get_deno_info()['available'],
+            'deno_version': get_deno_info()['version']
         },
         'stats': {
             'total_users': total_users,
@@ -5303,7 +5363,7 @@ def download():
             try:
                 safe = "".join(c for c in title if c.isalnum() or c in (' ', '-', '_')).rstrip() \
                     or f'download_{int(time.time())}'
-                opts = {'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                opts = {'format': 'bestaudio/best/ba*/b*',
                         'outtmpl': os.path.join(udir, f'{safe}.%(ext)s'),
                         'quiet': True, 'no_warnings': True, 'socket_timeout': 30,
                         'noplaylist': True, 'skip_unavailable_fragments': True}
@@ -5662,24 +5722,47 @@ def search():
         return jsonify({'error': f'Search failed: {e}', 'results': []})
 
 
+def _pick_best_stream_url(info):
+    if not info:
+        return None
+    if info.get('url') and info.get('acodec') != 'none':
+        return info.get('url')
+    formats = info.get('formats') or []
+    audio_only = [f for f in formats if f.get('acodec') != 'none' and f.get('vcodec') == 'none' and f.get('url')]
+    if audio_only:
+        m4a_audio = [f for f in audio_only if f.get('ext') == 'm4a']
+        if m4a_audio:
+            best_m4a = max(m4a_audio, key=lambda f: f.get('abr') or f.get('tbr') or 0)
+            return best_m4a.get('url')
+        best_audio = max(audio_only, key=lambda f: f.get('abr') or f.get('tbr') or 0)
+        return best_audio.get('url')
+    with_audio = [f for f in formats if f.get('acodec') != 'none' and f.get('url')]
+    if with_audio:
+        return with_audio[-1].get('url')
+    return info.get('url')
+
+
 @app.route('/api/stream')
 def stream():
     url = request.args.get('url', '').strip()
     if not url:
         return jsonify({'error': 'Empty URL'}), 400
-    ydl_opts = {'format': 'bestaudio[ext=m4a]/bestaudio/best', 'quiet': True, 'no_warnings': True,
+    ydl_opts = {'format': 'bestaudio/best/ba*/b*', 'quiet': True, 'no_warnings': True,
                 'socket_timeout': 30, 'noplaylist': True, 'skip_unavailable_fragments': True}
     try:
-        with YDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        try:
+            with YDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except (DownloadError, ExtractorError) as e:
+            if 'format is not available' in str(e).lower() or 'requested format' in str(e).lower():
+                with YDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 30, 'noplaylist': True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+            else:
+                raise
+
         if not info:
             return jsonify({'error': 'Could not read that video'}), 502
-        stream_url = info.get('url')
-        if not stream_url:
-            for fmt in reversed(info.get('formats') or []):
-                if fmt.get('acodec') != 'none' and fmt.get('url'):
-                    stream_url = fmt.get('url')
-                    break
+        stream_url = _pick_best_stream_url(info)
         if not stream_url:
             return jsonify({'error': 'Could not extract stream URL'}), 502
         return redirect(stream_url)
@@ -6485,6 +6568,8 @@ if __name__ == '__main__':
     print(f"💡 Dev code mode:", "ON" if LEAK_DEV_CODE else "OFF (set SPOPUDAY_DEV_CODE=1)")
     _active_cookies = get_yt_cookies_path()
     print(f"🍪 YouTube cookies:", _active_cookies if _active_cookies else "none")
+    _dinfo = get_deno_info()
+    print(f"🦕 Deno JS engine:", f"ON ({_dinfo['version']})" if _dinfo['available'] else "OFF (fallback to built-in interpreter)")
     print(f"🔎 Per-video metadata fetch:", "ON" if META_FETCH else "OFF (set SPOPUDAY_META_FETCH=1)")
     print(f"📝 Lyrics source: LRCLIB (primary)" + (", YouTube captions (fallback)" if LYRICS_YT_FALLBACK else ""))
     print(f"🛡️  Rate limits: {GLOBAL_RATE['burst_limit']} req / {GLOBAL_RATE['burst_window']}s  "
