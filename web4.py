@@ -322,11 +322,14 @@ def YDL(opts=None):
         o.setdefault('remote_components', ['ejs:npm'])
 
     # 3. Safe format & playlist defaults
+    # Restrict to YouTube extractors (50x faster init, prevents worker timeouts)
+    o.setdefault('allowed_extractors', ['youtube', 'youtubetab'])
     # 'bestaudio/best/18' — itag 18 (360p MP4, combined audio+video) is immune to SABR
     # and never withholds the direct URL, so it works as a last-resort audio source.
     o.setdefault('format', 'bestaudio/best/18')
     o.setdefault('noplaylist', True)
     o.setdefault('ignore_no_formats_error', True)
+    o.setdefault('socket_timeout', 15)
 
     ext_args = o.setdefault('extractor_args', {})
     yt_tab = ext_args.setdefault('youtubetab', {})
@@ -5884,6 +5887,20 @@ def _pick_best_stream_url(info):
     return None
 
 
+_STREAM_URL_CACHE = {}  # {video_id: (url, expire_at)}
+
+def get_cached_stream_url(vid):
+    item = _STREAM_URL_CACHE.get(vid)
+    if item and time.time() < item[1]:
+        return item[0]
+    return None
+
+def set_cached_stream_url(vid, url, ttl=7200):  # Cache direct audio URLs for 2 hours
+    if len(_STREAM_URL_CACHE) > 500:
+        _STREAM_URL_CACHE.clear()
+    _STREAM_URL_CACHE[vid] = (url, time.time() + ttl)
+
+
 @app.route('/api/stream')
 def stream():
     raw_url = request.args.get('url', '').strip()
@@ -5894,6 +5911,12 @@ def stream():
     m = VID_RE.search(raw_url)
     video_id = m.group(1) if m else raw_url[:30]
 
+    # Instant playback cache hit (<1ms)
+    cached_stream = get_cached_stream_url(video_id)
+    if cached_stream:
+        print(f'[Stream] Cache HIT for {video_id} -> instant playback!')
+        return redirect(cached_stream)
+
     deno_bin = DENO_PATH or get_deno_path()
     deno_info = get_deno_info()
     has_cookies = bool(get_yt_cookies_path())
@@ -5903,10 +5926,11 @@ def stream():
         'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best/18',
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 30,
+        'socket_timeout': 15,
         'noplaylist': True,
         'skip_unavailable_fragments': True,
-        'ignore_no_formats_error': True
+        'ignore_no_formats_error': True,
+        'allowed_extractors': ['youtube', 'youtubetab'],
     }
     if deno_bin:
         ydl_opts['js_runtimes'] = {'deno': {'path': deno_bin}}
@@ -5981,6 +6005,7 @@ def stream():
             print(f'[Stream] Tier 3 extraction failed for {video_id}: {last_err[:200]}')
 
     if stream_url:
+        set_cached_stream_url(video_id, stream_url)
         return redirect(stream_url)
 
     # Diagnostic error reporting without exposing sensitive data
@@ -6422,8 +6447,8 @@ def sigmoid(x):
     return 1 / (1 + math.exp(-max(-30, min(30, x))))
 
 
-_OPTS = {'quiet': True, 'no_warnings': True, 'socket_timeout': 30, 'extract_flat': 'in_playlist',
-         'ignoreerrors': True, 'geo_bypass': True}
+_OPTS = {'quiet': True, 'no_warnings': True, 'socket_timeout': 15, 'extract_flat': 'in_playlist',
+         'ignoreerrors': True, 'geo_bypass': True, 'allowed_extractors': ['youtube', 'youtubetab']}
 
 
 def _flat(url, **extra):
@@ -6760,13 +6785,33 @@ def recommend_next(uid, sid, url, title, exclude, n=15):
     return picked
 
 
+_RELATED_CACHE = {}  # {cache_key: (results, expire_at)}
+
+def get_cached_related(key):
+    item = _RELATED_CACHE.get(key)
+    if item and time.time() < item[1]:
+        return item[0]
+    return None
+
+def set_cached_related(key, res, ttl=900):  # 15 minutes cache
+    if len(_RELATED_CACHE) > 200:
+        _RELATED_CACHE.clear()
+    _RELATED_CACHE[key] = (res, time.time() + ttl)
+
+
 @app.route('/api/related')
 def related():
     try:
+        url_param = request.args.get('url', '').strip()
+        title_param = request.args.get('title', '').strip()
+        cache_key = f"{url_param}|{title_param}"
+        cached_res = get_cached_related(cache_key)
+        if cached_res:
+            return jsonify({'results': cached_res})
+
         exclude = {x for x in request.args.get('exclude', '').split(',') if x}
         uid = g.user['id'] if g.user else -1
-        res = recommend_next(uid, g.sid, request.args.get('url', '').strip(),
-                             request.args.get('title', '').strip(), exclude)
+        res = recommend_next(uid, g.sid, url_param, title_param, exclude)
         if res and g.user:
             rows = [r for r in xl_all('downloads') if r.get('user_id') == g.user['id']]
             by_vid = {}
@@ -6777,6 +6822,8 @@ def related():
                 r = by_vid.get(it['url'][-11:])
                 if r:
                     it.update({'id': r['id'], 'filename': r['filename'], 'thumbnail': r['thumbnail'] or it['thumbnail']})
+        if res:
+            set_cached_related(cache_key, res)
         return jsonify({'results': res})
     except (DownloadError, ExtractorError) as e:
         print(f'❌ related blocked/failed: {e}')
