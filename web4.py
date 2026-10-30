@@ -99,6 +99,9 @@ def get_deno_path():
     return None
 
 def _setup_deno_runtime():
+    # Cap Deno V8 heap to 128MB to prevent Render 512MB RAM OOM container restarts
+    os.environ['DENO_USE_CGROUPS'] = '1'
+    os.environ['DENO_V8_FLAGS'] = '--max-old-space-size=128'
     deno_bin = get_deno_path()
     if deno_bin:
         deno_dir = os.path.dirname(deno_bin)
