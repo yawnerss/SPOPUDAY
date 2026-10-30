@@ -5899,6 +5899,14 @@ def stream():
     try:
         with YDL(ydl_opts) as ydl:
             info = ydl.extract_info(raw_url, download=False)
+            # DEBUG: dump format info
+            print(f"[DEBUG] Video ID: {info.get('id')}")
+            for f in info.get('formats', []):
+                print('[FORMAT] id:', f.get('format_id'),
+                      'audio:', f.get('acodec'),
+                      'video:', f.get('vcodec'),
+                      'url:', bool(f.get('url')),
+                      'protocol:', f.get('protocol'))
             stream_url = _pick_best_stream_url(info)
             fmts = (info or {}).get('formats') or []
             has_url_count = sum(1 for f in fmts if f.get('url'))
