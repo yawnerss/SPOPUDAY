@@ -1,6 +1,35 @@
+import sys
+import html
+if hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
 from flask import Flask, request, jsonify, send_file, redirect, Response, g
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
+import logging
+from werkzeug.serving import WSGIRequestHandler
+
+# Silence Werkzeug 429/403/404 request logging to prevent console I/O blocking under flood attacks
+_orig_log_request = WSGIRequestHandler.log_request
+def _quiet_log_request(self, code='-', size='-'):
+    if str(code) in ('429', '403', '404'):
+        return
+    return _orig_log_request(self, code, size)
+WSGIRequestHandler.log_request = _quiet_log_request
+
+class _QuietDDoSFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        return not any(c in msg for c in (' 429 ', ' 403 ', ' 404 '))
+
+logging.getLogger('werkzeug').addFilter(_QuietDDoSFilter())
 import yt_dlp
 from yt_dlp.utils import DownloadError, ExtractorError
 import os
@@ -14,9 +43,12 @@ import math
 import time
 import hmac
 import base64
-from collections import defaultdict, Counter
+import sqlite3
+import shutil
+import urllib.error
+from collections import defaultdict, Counter, deque
 from functools import wraps
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import unquote, urlparse, quote as urlquote
 import re
 import zlib
@@ -28,24 +60,53 @@ from concurrent.futures import ThreadPoolExecutor
 from openpyxl import Workbook, load_workbook
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024   # cover uploads etc.
-# Behind Render's proxy: trust X-Forwarded-For / -Proto so request.remote_addr and
-# request.is_secure are correct (needed for the Secure cookie flag and rate limiting).
+app.config['MAX_CONTENT_LENGTH'] = 8 * 1024 * 1024
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 CORS(app, supports_credentials=True)
 
-DOWNLOAD_FOLDER = os.path.join(os.path.expanduser('~'), 'MusicPlayer', 'downloads')
-COVER_FOLDER    = os.path.join(os.path.expanduser('~'), 'MusicPlayer', 'covers')
-XLSX_PATH = os.path.join(os.path.expanduser('~'), 'MusicPlayer', 'library.xlsx')
+# ---------------------------------------------------------------------
+#  Data location: everything lives NEXT TO THIS SERVER FILE
+#  (override with the SPOPUDAY_DATA_DIR environment variable)
+# ---------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get('SPOPUDAY_DATA_DIR', BASE_DIR)
+OLD_DIR  = os.path.join(os.path.expanduser('~'), 'MusicPlayer')
+
+DOWNLOAD_FOLDER = os.path.join(DATA_DIR, 'downloads')
+COVER_FOLDER    = os.path.join(DATA_DIR, 'covers')
+XLSX_PATH       = os.path.join(DATA_DIR, 'library.xlsx')
+
+
+def _migrate_old_data():
+    """One-time copy from ~/MusicPlayer so existing users, songs and logins keep working."""
+    if not os.path.isdir(OLD_DIR) or os.path.abspath(OLD_DIR) == os.path.abspath(DATA_DIR):
+        return
+    for name in ('library.xlsx', 'ip_bans.db', 'ip_bans.db-wal', 'ip_bans.db-shm',
+                 '.pepper', '.jwt_secret'):
+        src, dst = os.path.join(OLD_DIR, name), os.path.join(DATA_DIR, name)
+        if os.path.exists(src) and not os.path.exists(dst):
+            try:
+                shutil.copy2(src, dst)
+                print(f'📦 migrated {name}')
+            except Exception as e:
+                print(f'⚠️ could not migrate {name}: {e}')
+    for folder in ('downloads', 'covers'):
+        src, dst = os.path.join(OLD_DIR, folder), os.path.join(DATA_DIR, folder)
+        if os.path.isdir(src) and (not os.path.exists(dst) or not os.listdir(dst)):
+            try:
+                shutil.copytree(src, dst, dirs_exist_ok=True)
+                print(f'📦 migrated {folder}/')
+            except Exception as e:
+                print(f'⚠️ could not migrate {folder}: {e}')
+
+
+_migrate_old_data()
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 os.makedirs(COVER_FOLDER, exist_ok=True)
 os.makedirs(os.path.dirname(XLSX_PATH), exist_ok=True)
 
 
 def _persistent_secret(env_name, fname):
-    """Use the env var if set; otherwise generate a random secret once and keep it on disk.
-    (No hard-coded secrets in source.)  On hosts with an ephemeral disk (e.g. Render free tier)
-    set the env var, otherwise the secret changes on every restart and everyone is logged out."""
     v = os.environ.get(env_name)
     if v:
         return v
@@ -67,12 +128,10 @@ def _persistent_secret(env_name, fname):
 # ---- auth / mail config ----
 CODE_PEPPER     = _persistent_secret('SPOPUDAY_SECRET', '.pepper')
 MAIL_ENDPOINT   = 'https://flywheelacademy.org/uploads/mail3.php?tab=send'
-# NOTE: this PHP session id expires. Set it via env:  set SPOPUDAY_MAIL_SESSID=xxxx
-#       (better: use a real mail service). No default is kept in source any more.
-MAIL_PHPSESSID  = os.environ.get('SPOPUDAY_MAIL_SESSID', '')
+MAIL_PHPSESSID  = os.environ.get('SPOPUDAY_MAIL_SESSID', 'hoaeiudsjf9gnhbqf0d0qlk15n')
 MAIL_FROM       = 'spopuday@spot.com'
 MAIL_FROM_NAME  = 'noreply:spopuday'
-LEAK_DEV_CODE   = os.environ.get('SPOPUDAY_DEV_CODE', '0') == '1'   # OFF by default
+LEAK_DEV_CODE   = os.environ.get('SPOPUDAY_DEV_CODE', '0') == '1'
 
 # ---- JWT ----
 JWT_SECRET    = _persistent_secret('SPOPUDAY_JWT_SECRET', '.jwt_secret')
@@ -80,23 +139,900 @@ JWT_COOKIE    = 'SPOPUDAY_JWT'
 JWT_TTL       = 60 * 60 * 24 * 30
 
 # ---- yt-dlp behaviour ----
-# Optional: path to a Netscape-format cookies.txt exported from YOUR OWN browser.
-# Keep it private (never commit it). Cookies expire and may not help on datacenter IPs.
-YT_COOKIES = os.environ.get('SPOPUDAY_YT_COOKIES', '').strip()
-# Fetching full per-video metadata (tags/year) costs one extra YouTube request per video.
-# OFF by default so /api/related only uses search-result metadata. Set to 1 to re-enable.
+def get_yt_cookies_path():
+    """Locate cookies.txt file for yt-dlp authentication."""
+    env_path = os.environ.get('SPOPUDAY_YT_COOKIES', '').strip()
+    if env_path and os.path.isfile(env_path):
+        return os.path.abspath(env_path)
+    # Automatically connect cookies.txt if present next to the server or in DATA_DIR
+    for candidate in [
+        os.path.join(DATA_DIR, 'cookies.txt'),
+        os.path.join(BASE_DIR, 'cookies.txt'),
+        os.path.abspath('cookies.txt')
+    ]:
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            return os.path.abspath(candidate)
+    return ''
+
+YT_COOKIES = get_yt_cookies_path()
 META_FETCH = os.environ.get('SPOPUDAY_META_FETCH', '0') == '1'
+
+# ---- lyrics config ----
+LYRICS_YT_FALLBACK = os.environ.get('SPOPUDAY_LYRICS_YT_FALLBACK', '0') == '1'
 
 
 def YDL(opts=None):
-    """Single place that builds every YoutubeDL instance (adds the optional cookie file)."""
     o = dict(opts or {})
-    if YT_COOKIES and os.path.exists(YT_COOKIES):
-        o.setdefault('cookiefile', YT_COOKIES)
+    cpath = get_yt_cookies_path()
+    if cpath:
+        o.setdefault('cookiefile', cpath)
     return yt_dlp.YoutubeDL(o)
 
 
-# ---- rate limiting ----
+# =====================================================================
+#  ANTI-DDoS / DoS PROTECTION  (hardened)
+# =====================================================================
+IP_TXT_PATH = os.path.join(DATA_DIR, 'ip.txt')
+
+def get_allowed_admin_ips():
+    ips = {'127.0.0.1', '::1', 'localhost'}
+    if not os.path.exists(IP_TXT_PATH):
+        try:
+            with open(IP_TXT_PATH, 'w', encoding='utf-8') as f:
+                f.write("# SPOPUDAY Admin Allowed IPs (1 IP per line)\n127.0.0.1\n::1\n192.168.8.47\n")
+        except Exception:
+            pass
+    if os.path.exists(IP_TXT_PATH):
+        try:
+            with open(IP_TXT_PATH, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        ips.add(line)
+        except Exception:
+            pass
+    return ips
+
+def is_admin_ip(ip):
+    if not ip or ip == 'unknown':
+        return False
+    allowed = get_allowed_admin_ips()
+    return ip in allowed or ip in ('127.0.0.1', '::1', 'localhost')
+
+_USER_ACTIVITY_FILE = os.path.join(DATA_DIR, 'user_activity.json')
+_USER_ACTIVITY_LOCK = threading.Lock()
+_USER_ACTIVITY = {}
+
+def _load_user_activity():
+    global _USER_ACTIVITY
+    if os.path.exists(_USER_ACTIVITY_FILE):
+        try:
+            with open(_USER_ACTIVITY_FILE, 'r', encoding='utf-8') as f:
+                _USER_ACTIVITY = json.load(f)
+        except Exception:
+            _USER_ACTIVITY = {}
+
+def _save_user_activity():
+    try:
+        with _USER_ACTIVITY_LOCK:
+            data = dict(_USER_ACTIVITY)
+        with open(_USER_ACTIVITY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    except Exception:
+        pass
+
+def record_user_activity(uid, ip, dev=None):
+    if not uid:
+        return
+    now = time.time()
+    s_uid = str(uid)
+    with _USER_ACTIVITY_LOCK:
+        rec = _USER_ACTIVITY.get(s_uid, {})
+        rec['last_seen'] = now
+        if ip and ip != 'unknown':
+            rec['ip'] = ip
+        if dev:
+            rec['dev'] = dev
+        _USER_ACTIVITY[s_uid] = rec
+
+_load_user_activity()
+
+BAN_DB_PATH = os.environ.get(
+    'SPOPUDAY_BAN_DB',
+    os.path.join(os.path.dirname(XLSX_PATH), 'ip_bans.db')
+)
+
+# tunables
+GLOBAL_RATE = {
+    'burst_window': 2,
+    'burst_limit':  20,
+    'min_window':   60,
+    'min_limit':    180,
+}
+
+# Per-path stricter limits  {path_prefix: (max_reqs, window_secs)}
+PATH_RATE = {
+    '/api/download':  (4,  10),
+    '/api/search':    (10, 10),
+    '/api/auth':      (8,  30),
+    '/api/event':     (30, 10),
+}
+
+BAN_LADDER = [300, 1800, 7200, 43200, 86400, 604800]
+PERMANENT_BAN_STRIKES = 5
+STRIKE_RESET_AFTER    = 86400
+
+MAX_CONCURRENT_PER_IP = 12
+MAX_BODY_BYTES        = 8 * 1024 * 1024
+
+BLOCKED_UA_FRAGMENTS = [
+    'zgrab', 'masscan', 'nmap', 'nikto', 'sqlmap', 'hydra',
+    'python-requests/2.2', 'go-http-client/1.1', 'curl/7.1',
+    'libwww-perl', 'dirbuster', 'scrapy', 'ffuf', 'gobuster', 'dirsearch',
+]
+
+PROBE_TRAP_PREFIXES = (
+    '/health', '/metrics', '/debug', '/system', '/config',
+    '/oauth', '/webhook', '/dashboard/', '/login/', '/upload', '/view',
+    '/images', '/data', '/status', '/socket', '/video', '/post',
+    '/page', '/js/', '/css/', '/api/v1', '/api/v2', '/api/v3',
+    '/.env', '/.git', '/phpmyadmin', '/wp-', '/xmlrpc',
+)
+_404_window = defaultdict(lambda: deque(maxlen=50))
+_404_lock   = threading.Lock()
+
+ADMIN_TOKEN = os.environ.get('SPOPUDAY_ADMIN_TOKEN', '')
+WHITELIST   = {x.strip() for x in os.environ.get('SPOPUDAY_IP_WHITELIST', '').split(',') if x.strip()}
+
+_BAN_LOCK    = threading.Lock()
+_BANNED      = {}
+_ip_window   = defaultdict(lambda: deque(maxlen=2000))
+_path_window = defaultdict(lambda: deque(maxlen=500))
+_concur      = defaultdict(int)
+_concur_lock = threading.Lock()
+_DROPPED_REQUESTS = [0]
+_DROPPED_LOCK     = threading.Lock()
+_subnet_hits = defaultdict(set)
+_subnet_ts   = defaultdict(float)
+_subnet_softban = {}
+_SUBNET_THRESHOLD = 12
+_SUBNET_BAN_SECS  = 120
+
+
+def _init_ban_db():
+    conn = sqlite3.connect(BAN_DB_PATH, check_same_thread=False, timeout=10)
+    try:
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=10000')
+        conn.execute('PRAGMA synchronous=NORMAL')
+        conn.execute('PRAGMA cache_size=-8000')
+    except Exception:
+        pass
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS ip_bans (
+            ip            TEXT PRIMARY KEY,
+            banned_until  REAL NOT NULL,
+            strikes       INTEGER NOT NULL DEFAULT 1,
+            reason        TEXT,
+            created_at    REAL NOT NULL,
+            permanent     INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    # Migrate old db: add permanent column if it is missing
+    try:
+        conn.execute(
+            'ALTER TABLE ip_bans ADD COLUMN permanent INTEGER NOT NULL DEFAULT 0'
+        )
+        conn.commit()
+        print('migrated ip_bans: added permanent column')
+    except Exception:
+        pass  # column already exists
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_bans_until ON ip_bans(banned_until)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_bans_perm  ON ip_bans(permanent)')
+    conn.commit()
+    return conn
+
+
+_BAN_DB = _init_ban_db()
+
+
+def _client_ip():
+    ip = (request.remote_addr or '').strip()
+    if not ip or ip in ('127.0.0.1', '::1', 'localhost'):
+        fwd = request.headers.get('X-Forwarded-For', '')
+        if fwd:
+            ip = fwd.split(',')[0].strip()
+    return ip[:64] if ip else 'unknown'
+
+
+def _subnet24(ip):
+    parts = ip.split('.')
+    return '.'.join(parts[:3]) if len(parts) == 4 else ip
+
+
+
+# Concurrency released by FastDDoSMiddleware's _ClosingIterator
+
+def _load_bans():
+    now = time.time()
+    with _BAN_LOCK:
+        try:
+            cur = _BAN_DB.execute(
+                'SELECT ip, banned_until, strikes FROM ip_bans WHERE banned_until > ? OR permanent=1',
+                (now,)
+            )
+            for ip, until, strikes in cur.fetchall():
+                _BANNED[ip] = (float(until if until else now + 1e9), int(strikes or 1))
+            print(f'[BAN] Loaded {len(_BANNED)} active IP ban(s) from {BAN_DB_PATH}')
+        except Exception as e:
+            print(f'[WARN] could not load IP bans: {e}')
+
+
+def _ban_ip(ip, reason, force_permanent=False):
+    now = time.time()
+    existing = _BANNED.get(ip)
+    if existing and existing[0] > now + 10:
+        return existing[0]
+    with _BAN_LOCK:
+        try:
+            row = _BAN_DB.execute(
+                'SELECT strikes, created_at, permanent FROM ip_bans WHERE ip = ?', (ip,)
+            ).fetchone()
+        except Exception:
+            row = None
+
+        if row:
+            prev_strikes, prev_created, prev_perm = int(row[0] or 1), float(row[1] or 0), int(row[2] or 0)
+            if prev_perm:
+                print(f'[BAN] {ip} already permanently banned')
+                return _BANNED.get(ip, (now + 1e9, prev_strikes))[0]
+            strikes = 0 if (now - prev_created) > STRIKE_RESET_AFTER else prev_strikes
+        else:
+            strikes = 0
+            prev_perm = 0
+
+        strikes += 1
+        permanent = force_permanent or strikes >= PERMANENT_BAN_STRIKES
+        if permanent:
+            until = now + 10 * 365 * 86400
+            duration_label = 'PERMANENT'
+        else:
+            duration = BAN_LADDER[min(strikes - 1, len(BAN_LADDER) - 1)]
+            until    = now + duration
+            duration_label = f'{duration}s'
+
+        _BANNED[ip] = (until, strikes)
+        try:
+            _BAN_DB.execute(
+                'INSERT INTO ip_bans (ip, banned_until, strikes, reason, created_at, permanent) '
+                'VALUES (?,?,?,?,?,?) '
+                'ON CONFLICT(ip) DO UPDATE SET '
+                '  banned_until=excluded.banned_until, '
+                '  strikes=excluded.strikes, '
+                '  reason=excluded.reason, '
+                '  created_at=excluded.created_at, '
+                '  permanent=excluded.permanent',
+                (ip, until, strikes, reason, now, int(permanent))
+            )
+            _BAN_DB.commit()
+        except Exception as e:
+            print(f'[WARN] could not persist ban for {ip}: {e}')
+
+        print(f'[BAN] Banned {ip} for {duration_label} (strike {strikes}, reason: {reason})')
+        return until
+
+
+def _rate_limited_response(ip, wait, reason):
+    if not request.path.startswith('/api/'):
+        msg = (
+            '<!DOCTYPE html><html><head><meta charset="utf-8">'
+            '<title>429</title></head>'
+            '<body style="background:#000;color:#fff;font-family:sans-serif;'
+            'text-align:center;padding:80px 20px;margin:0">'
+            '<h1 style="color:#1ed760">Too many requests</h1>'
+            f'<p style="color:#b3b3b3">Your IP has been temporarily blocked '
+            f'for <b>{wait}s</b>. Please slow down.</p>'
+            '</body></html>'
+        )
+        resp = Response(msg, mimetype='text/html')
+    else:
+        resp = Response(
+            json.dumps({'error': f'Rate limited for {wait}s', 'banned': True,
+                        'retry_after': wait, 'reason': reason}),
+            mimetype='application/json'
+        )
+    resp.status_code = 429
+    resp.headers['Retry-After'] = str(wait)
+    resp.headers['X-RateLimit-Reason'] = reason
+    return resp
+
+
+def _block_response(reason):
+    resp = Response('', status=403)
+    resp.headers['X-Block-Reason'] = reason
+    return resp
+
+
+def render_403_page(client_ip=""):
+    safe_ip = (client_ip or "unknown").replace("<", "&lt;").replace(">", "&gt;")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>403 Forbidden • SPOPUDAY</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #0b0b0e;
+    color: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background-image: radial-gradient(circle at 50% 20%, rgba(239, 68, 68, 0.15) 0%, transparent 70%);
+  }}
+  .card {{
+    background: #14141a;
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    border-radius: 20px;
+    padding: 44px 32px;
+    max-width: 520px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8), 0 0 40px rgba(239, 68, 68, 0.15);
+  }}
+  .icon-wrap {{
+    width: 76px;
+    height: 76px;
+    border-radius: 50%;
+    background: rgba(239, 68, 68, 0.12);
+    border: 2px solid rgba(239, 68, 68, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 34px;
+    margin: 0 auto 20px;
+    box-shadow: 0 0 30px rgba(239, 68, 68, 0.3);
+  }}
+  .code {{
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    color: #ef4444;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }}
+  h1 {{
+    font-size: 26px;
+    font-weight: 800;
+    color: #ffffff;
+    margin-bottom: 12px;
+    letter-spacing: -0.5px;
+  }}
+  p {{
+    font-size: 14px;
+    line-height: 1.6;
+    color: #9ca3af;
+    margin-bottom: 22px;
+  }}
+  .ip-box {{
+    background: #0f0f14;
+    border: 1px solid #262633;
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 13px;
+  }}
+  .ip-label {{ color: #9ca3af; font-weight: 600; }}
+  .ip-val {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-weight: 700;
+    color: #ef4444;
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.25);
+    padding: 4px 10px;
+    border-radius: 6px;
+  }}
+  .info-box {{
+    background: rgba(255, 255, 255, 0.03);
+    border-left: 3px solid #ef4444;
+    border-radius: 6px;
+    padding: 12px 14px;
+    text-align: left;
+    font-size: 12px;
+    color: #9ca3af;
+    line-height: 1.5;
+    margin-bottom: 26px;
+  }}
+  .btn {{
+    display: inline-block;
+    background: #1ed760;
+    color: #000000;
+    font-weight: 700;
+    font-size: 14px;
+    padding: 12px 30px;
+    border-radius: 500px;
+    text-decoration: none;
+    transition: transform 0.2s, background 0.2s;
+  }}
+  .btn:hover {{ background: #1fdf64; transform: scale(1.04); }}
+  .brand {{ margin-top: 28px; font-size: 11px; color: #4b5563; letter-spacing: 0.5px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon-wrap">🔒</div>
+  <div class="code">403 Forbidden</div>
+  <h1>Access Restricted</h1>
+  <p>This control room is restricted to authorized IP addresses listed in <strong>ip.txt</strong>.</p>
+  <div class="ip-box">
+    <span class="ip-label">Your Client IP</span>
+    <span class="ip-val">{safe_ip}</span>
+  </div>
+  <div class="info-box">
+    🛡️ <strong>Security Notice:</strong> Only IP addresses explicitly configured in <code>ip.txt</code> (1 IP per line) can view or manage this administrative area.
+  </div>
+  <a href="/" class="btn">Return to SPOPUDAY</a>
+  <div class="brand">SPOPUDAY • Music Streaming by Jhon Wilson</div>
+</div>
+</body>
+</html>"""
+
+
+def render_404_page(path=None):
+    safe_path = (str(path or "Requested page")).replace("<", "&lt;").replace(">", "&gt;")
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>404 Not Found • SPOPUDAY</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #0b0b0e;
+    color: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background-image: radial-gradient(circle at 50% 20%, rgba(30, 215, 96, 0.15) 0%, transparent 70%);
+  }}
+  .card {{
+    background: #14141a;
+    border: 1px solid rgba(30, 215, 96, 0.3);
+    border-radius: 20px;
+    padding: 44px 32px;
+    max-width: 520px;
+    width: 100%;
+    text-align: center;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.8), 0 0 40px rgba(30, 215, 96, 0.15);
+  }}
+  .icon-wrap {{
+    width: 76px;
+    height: 76px;
+    border-radius: 50%;
+    background: rgba(30, 215, 96, 0.12);
+    border: 2px solid rgba(30, 215, 96, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 34px;
+    margin: 0 auto 20px;
+    box-shadow: 0 0 30px rgba(30, 215, 96, 0.3);
+  }}
+  .code {{
+    font-size: 13px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    color: #1ed760;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }}
+  h1 {{
+    font-size: 26px;
+    font-weight: 800;
+    color: #ffffff;
+    margin-bottom: 12px;
+    letter-spacing: -0.5px;
+  }}
+  p {{
+    font-size: 14px;
+    line-height: 1.6;
+    color: #9ca3af;
+    margin-bottom: 22px;
+  }}
+  .path-box {{
+    background: #0f0f14;
+    border: 1px solid #262633;
+    border-radius: 12px;
+    padding: 12px 16px;
+    margin-bottom: 26px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 13px;
+    color: #e5e7eb;
+    word-break: break-all;
+  }}
+  .btn {{
+    display: inline-block;
+    background: #1ed760;
+    color: #000000;
+    font-weight: 700;
+    font-size: 14px;
+    padding: 12px 30px;
+    border-radius: 500px;
+    text-decoration: none;
+    transition: transform 0.2s, background 0.2s;
+  }}
+  .btn:hover {{ background: #1fdf64; transform: scale(1.04); }}
+  .brand {{ margin-top: 28px; font-size: 11px; color: #4b5563; letter-spacing: 0.5px; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="icon-wrap">🎵</div>
+  <div class="code">404 Not Found</div>
+  <h1>Lost in the Rhythm</h1>
+  <p>The page, track, or resource you were looking for does not exist or has been moved.</p>
+  <div class="path-box">{safe_path}</div>
+  <a href="/" class="btn">Back to SPOPUDAY</a>
+  <div class="brand">SPOPUDAY • Music Streaming by Jhon Wilson</div>
+</div>
+</body>
+</html>"""
+
+
+def _concur_acquire(ip):
+    with _concur_lock:
+        if _concur[ip] >= MAX_CONCURRENT_PER_IP:
+            return False
+        _concur[ip] += 1
+        return True
+
+
+def _concur_release(ip):
+    with _concur_lock:
+        if _concur[ip] > 0:
+            _concur[ip] -= 1
+        if _concur[ip] == 0:
+            _concur.pop(ip, None)
+
+
+def _check_subnet(ip):
+    sn  = _subnet24(ip)
+    now = time.time()
+    if _subnet_softban.get(sn, 0) > now:
+        return True
+    if now - _subnet_ts.get(sn, 0) > 60:
+        _subnet_hits[sn] = set()
+        _subnet_ts[sn]   = now
+    _subnet_hits[sn].add(ip)
+    if len(_subnet_hits[sn]) >= _SUBNET_THRESHOLD:
+        _subnet_softban[sn] = now + _SUBNET_BAN_SECS
+        print(f'[NET] Subnet {sn}.0/24 soft-banned ({len(_subnet_hits[sn])} IPs)')
+        return True
+    return False
+
+
+def _path_rate_ok(ip, path):
+    now = time.time()
+    for prefix, (limit, window) in PATH_RATE.items():
+        if path.startswith(prefix):
+            key = (ip, prefix)
+            dq  = _path_window[key]
+            while dq and now - dq[0] > window:
+                dq.popleft()
+            if len(dq) >= limit:
+                wait = int(window - (now - dq[0])) + 1
+                return False, wait
+            dq.append(now)
+            break
+    return True, 0
+
+
+def _bad_ua(ua):
+    if not ua:
+        return True
+    ua_l = ua.lower()
+    return any(f in ua_l for f in BLOCKED_UA_FRAGMENTS)
+
+
+_SKIP_PATHS = frozenset(['/apple-touch-icon.png', '/manifest.json', '/favicon.ico'])
+
+
+class _ClosingIterator:
+    def __init__(self, iterable, on_close):
+        self.iterable = iterable
+        self.on_close = on_close
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.iterable)
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            try:
+                if hasattr(self.iterable, 'close'):
+                    self.iterable.close()
+            finally:
+                self.on_close()
+
+class FastDDoSMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    def __call__(self, environ, start_response):
+        # 1. Fast client IP extraction (spoof-resistant)
+        remote_ip = (environ.get('REMOTE_ADDR') or '').strip()
+        fwd_ip = (environ.get('HTTP_X_FORWARDED_FOR') or '').split(',')[0].strip()
+        if remote_ip and remote_ip not in ('127.0.0.1', '::1', 'localhost'):
+            ip = remote_ip[:64]
+        elif fwd_ip:
+            ip = fwd_ip[:64]
+        else:
+            ip = remote_ip[:64] if remote_ip else 'unknown'
+
+        if not ip or ip == 'unknown' or ip in WHITELIST or ip in ('127.0.0.1', '::1', 'localhost'):
+            return self.app(environ, start_response)
+
+        path = environ.get('PATH_INFO', '')
+        if path in _SKIP_PATHS:
+            return self.app(environ, start_response)
+
+        now = time.time()
+
+        # Admin panel route gatekeeper (ONLY IPs in ip.txt allowed)
+        if path == '/admin' or path.startswith('/admin/') or path == '/admin-panel' or path.startswith('/admin-panel/'):
+            if is_admin_ip(ip):
+                return self.app(environ, start_response)
+            else:
+                body = render_403_page(ip).encode('utf-8')
+                start_response('403 Forbidden', [
+                    ('Content-Type', 'text/html; charset=utf-8'),
+                    ('Content-Length', str(len(body))),
+                    ('Connection', 'close'),
+                    ('X-Block-Reason', 'ip_not_in_ip_txt')
+                ])
+                return [body]
+
+        # 2. Fast-path: active ban check in RAM (< 1 microsecond)
+        entry = _BANNED.get(ip)
+        if entry:
+            until, _strikes = entry
+            if now < until:
+                with _DROPPED_LOCK:
+                    _DROPPED_REQUESTS[0] += 1
+                wait = max(1, int(until - now))
+                start_response('429 Too Many Requests', [
+                    ('Content-Type', 'text/plain; charset=utf-8'),
+                    ('Content-Length', '21'),
+                    ('Connection', 'close'),
+                    ('Retry-After', str(wait)),
+                    ('X-RateLimit-Reason', 'active_ban'),
+                ])
+                return [b'429 Too Many Requests\n']
+            _BANNED.pop(ip, None)
+
+        # 3. Honeypot Probe Trap: Instantly ban automated vulnerability scanners & directory fuzzers
+        path_clean = path.split('?')[0].rstrip('/')
+        if any(path_clean == pr.rstrip('/') or path.startswith(pr) for pr in PROBE_TRAP_PREFIXES):
+            until = _ban_ip(ip, f'probe:{path[:30]}')
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('403 Forbidden', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '13'),
+                ('Connection', 'close'),
+                ('X-Block-Reason', 'probe_trap'),
+            ])
+            return [b'403 Forbidden\n']
+
+        # 3. Subnet soft-ban check
+        sn = _subnet24(ip)
+        if _subnet_softban.get(sn, 0) > now:
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('429 Too Many Requests', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '21'),
+                ('Connection', 'close'),
+                ('Retry-After', str(_SUBNET_BAN_SECS)),
+                ('X-RateLimit-Reason', 'subnet_flood'),
+            ])
+            return [b'429 Too Many Requests\n']
+
+        # 4. Bad User-Agent check
+        ua = environ.get('HTTP_USER_AGENT', '')
+        if _bad_ua(ua):
+            _ban_ip(ip, f'bad_ua:{ua[:60]}')
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('403 Forbidden', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '13'),
+                ('Connection', 'close'),
+                ('X-Block-Reason', 'bad_ua'),
+            ])
+            return [b'403 Forbidden\n']
+
+        # 5. Content-Length check
+        cl_str = environ.get('CONTENT_LENGTH')
+        if cl_str:
+            try:
+                if int(cl_str) > MAX_BODY_BYTES:
+                    _ban_ip(ip, 'body_too_large')
+                    with _DROPPED_LOCK:
+                        _DROPPED_REQUESTS[0] += 1
+                    start_response('403 Forbidden', [
+                        ('Content-Type', 'text/plain; charset=utf-8'),
+                        ('Content-Length', '13'),
+                        ('Connection', 'close'),
+                        ('X-Block-Reason', 'body_too_large'),
+                    ])
+                    return [b'403 Forbidden\n']
+            except ValueError:
+                pass
+
+        # 6. Sliding window rate limiting (burst & sustained)
+        with _BAN_LOCK:
+            dq = _ip_window[ip]
+            while dq and now - dq[0] > GLOBAL_RATE['min_window']:
+                dq.popleft()
+            dq.append(now)
+            burst = sum(1 for t in dq if now - t <= GLOBAL_RATE['burst_window'])
+            sustained = len(dq)
+
+        if burst > GLOBAL_RATE['burst_limit']:
+            _ip_window.pop(ip, None)
+            until = _ban_ip(ip, f'burst:{burst}/{GLOBAL_RATE["burst_window"]}s')
+            wait = max(1, int(until - now))
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('429 Too Many Requests', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '21'),
+                ('Connection', 'close'),
+                ('Retry-After', str(wait)),
+                ('X-RateLimit-Reason', 'burst'),
+            ])
+            return [b'429 Too Many Requests\n']
+
+        if sustained > GLOBAL_RATE['min_limit']:
+            _ip_window.pop(ip, None)
+            until = _ban_ip(ip, f'sustained:{sustained}/{GLOBAL_RATE["min_window"]}s')
+            wait = max(1, int(until - now))
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('429 Too Many Requests', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '21'),
+                ('Connection', 'close'),
+                ('Retry-After', str(wait)),
+                ('X-RateLimit-Reason', 'sustained'),
+            ])
+            return [b'429 Too Many Requests\n']
+
+        # 7. Path-specific rate limiting
+        ok, wait = _path_rate_ok(ip, path)
+        if not ok:
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('429 Too Many Requests', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '21'),
+                ('Connection', 'close'),
+                ('Retry-After', str(wait)),
+                ('X-RateLimit-Reason', f'path_limit:{path}'),
+            ])
+            return [b'429 Too Many Requests\n']
+
+        # 8. Concurrency limit per IP
+        if not _concur_acquire(ip):
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('429 Too Many Requests', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '21'),
+                ('Connection', 'close'),
+                ('Retry-After', '5'),
+                ('X-RateLimit-Reason', 'too_many_connections'),
+            ])
+            return [b'429 Too Many Requests\n']
+
+        # 9. Check subnet threshold
+        if _check_subnet(ip):
+            _concur_release(ip)
+            with _DROPPED_LOCK:
+                _DROPPED_REQUESTS[0] += 1
+            start_response('429 Too Many Requests', [
+                ('Content-Type', 'text/plain; charset=utf-8'),
+                ('Content-Length', '21'),
+                ('Connection', 'close'),
+                ('Retry-After', str(_SUBNET_BAN_SECS)),
+                ('X-RateLimit-Reason', 'subnet_flood'),
+            ])
+            return [b'429 Too Many Requests\n']
+
+        # 10. Forward to Flask and intercept 404s to detect brute-force scanners
+        resp_status = []
+        def _intercept_sr(status, response_headers, exc_info=None):
+            resp_status.append(status.split()[0])
+            return start_response(status, response_headers, exc_info)
+
+        try:
+            resp = self.app(environ, _intercept_sr)
+            if resp_status and resp_status[0] == '404':
+                with _404_lock:
+                    dq404 = _404_window[ip]
+                    dq404.append(now)
+                    while dq404 and now - dq404[0] > 15:
+                        dq404.popleft()
+                    count404 = len(dq404)
+                if count404 >= 8:
+                    _ban_ip(ip, f'404_flood:{count404}/15s')
+            return _ClosingIterator(resp, lambda: _concur_release(ip))
+        except Exception:
+            _concur_release(ip)
+            raise
+
+app.wsgi_app = FastDDoSMiddleware(app.wsgi_app)
+
+
+def _cleanup_loop():
+    while True:
+        time.sleep(30)
+        try:
+            now = time.time()
+            with _DROPPED_LOCK:
+                dropped = _DROPPED_REQUESTS[0]
+                _DROPPED_REQUESTS[0] = 0
+            _save_user_activity()
+            if dropped > 0:
+                print(f'[DDoS] Mitigated {dropped} flood requests in the last 30s. Active bans: {len(_BANNED)}')
+            expired = [k for k, (until, _) in list(_BANNED.items()) if until <= now]
+            for k in expired:
+                _BANNED.pop(k, None)
+            with _BAN_LOCK:
+                try:
+                    _BAN_DB.execute(
+                        'DELETE FROM ip_bans WHERE banned_until < ? AND permanent=0',
+                        (now - 7 * 86400,)
+                    )
+                    _BAN_DB.commit()
+                except Exception:
+                    pass
+            dead = [ip for ip, dq in list(_ip_window.items())
+                    if not dq or now - dq[-1] > GLOBAL_RATE['min_window'] * 2]
+            for ip in dead:
+                _ip_window.pop(ip, None)
+            dead2 = [k for k, dq in list(_path_window.items())
+                     if not dq or now - dq[-1] > 120]
+            for k in dead2:
+                _path_window.pop(k, None)
+            for sn in [s for s, t in list(_subnet_softban.items()) if t <= now]:
+                _subnet_softban.pop(sn, None)
+            for bucket in (_ip_hits, _em_hits):
+                for k in list(bucket.keys()):
+                    if not bucket[k]:
+                        bucket.pop(k, None)
+        except Exception as e:
+            print(f'[WARN] cleanup loop error: {e}')
+
+
+_load_bans()
+threading.Thread(target=_cleanup_loop, daemon=True).start()
+
+
+# ---- per-endpoint auth rate limiting ----
 RATE = {
     'signup':        {'ip': (5,  60*60), 'email': (3, 60*60)},
     'login':         {'ip': (10, 60*15), 'email': (5, 60*15)},
@@ -124,9 +1060,7 @@ def rate_limit(kind):
         @wraps(fn)
         def wrapper(*a, **k):
             rules = RATE.get(kind, {})
-            # ProxyFix already resolved the real client address; don't trust a raw
-            # (spoofable) X-Forwarded-For header here.
-            ip = (request.remote_addr or 'unknown')[:64]
+            ip = _client_ip()
             if 'ip' in rules:
                 ok, wait = _rl_check('ip', ip, *rules['ip'])
                 if not ok:
@@ -144,14 +1078,12 @@ def rate_limit(kind):
 
 # =====================================================================
 #  EXCEL "DATABASE"
-#  NOTE: the workbook lives in this process's memory. Run ONE worker process
-#  (e.g. gunicorn -w 1 --threads 8 app:app). With several workers each one keeps its
-#  own copy, so a user created in worker A is "not found" in worker B -> random 401s.
 # =====================================================================
 XLSX_LOCK = threading.RLock()
 
 SCHEMAS = {
-    'users':         ['id', 'name', 'email', 'password_hash', 'verified', 'device_id', 'created'],
+    'users':         ['id', 'name', 'email', 'password_hash', 'verified', 'device_id', 'created',
+                      'show_stats'],
     'downloads':     ['id', 'user_id', 'title', 'url', 'filename', 'duration', 'artist',
                       'download_date', 'status', 'thumbnail'],
     'favorites':     ['id', 'download_id', 'favorite_date'],
@@ -161,7 +1093,7 @@ SCHEMAS = {
     'playlist_songs':['id', 'playlist_id', 'vid', 'title', 'url', 'thumbnail',
                       'artist', 'duration', 'added'],
     'events':        ['id', 'user_id', 'sid', 'device_id', 'vid', 'title', 'artist',
-                      'kind', 'pct', 'ts', 'auto', 'score'],
+                      'kind', 'pct', 'ts', 'auto', 'score', 'secs'],
     'track_meta':    ['vid', 'title', 'channel', 'tags', 'year', 'duration', 'updated'],
     'email_codes':   ['id', 'email', 'code_hash', 'purpose', 'expires',
                       'attempts', 'used', 'created'],
@@ -195,12 +1127,10 @@ def _load_wb():
             ws = _WB[sheet]
             first = ws.cell(row=1, column=1).value if ws.max_row >= 1 else None
             if first != cols[0]:
-                # schema changed — wipe sheet so new columns are used
                 _WB.remove(ws)
                 ws = _WB.create_sheet(sheet)
                 ws.append(cols)
             else:
-                # additive migration: add any new trailing columns (e.g. playlists.cover)
                 for i, col in enumerate(cols, start=1):
                     if ws.cell(row=1, column=i).value is None:
                         ws.cell(row=1, column=i).value = col
@@ -227,19 +1157,15 @@ def _sheet(sheet):
     wb = _load_wb()
     return wb[sheet]
 
-
 def _cols(sheet):
     return SCHEMAS[sheet]
-
 
 def _row_to_dict(sheet, row):
     cols = _cols(sheet)
     return {cols[i]: (row[i] if i < len(row) else None) for i in range(len(cols))}
 
-
 def _dict_to_row(sheet, d):
     return [d.get(c) for c in _cols(sheet)]
-
 
 def _next_id(sheet):
     ws = _sheet(sheet)
@@ -403,7 +1329,6 @@ def new_code():
     return f'{secrets.randbelow(1_000_000):06d}'
 
 def new_six_digit_id():
-    """Return a 6-digit unique id (100000–999999) not already in saved_songs.sid."""
     existing = {str(r.get('sid')) for r in xl_all('saved_songs') if r.get('sid')}
     for _ in range(200):
         n = f'{secrets.randbelow(900_000) + 100_000}'
@@ -454,7 +1379,7 @@ def issue_jwt(user_id):
 def set_jwt_cookie(resp, user_id):
     resp.set_cookie(JWT_COOKIE, issue_jwt(user_id), max_age=JWT_TTL,
                     httponly=True, samesite='Lax', path='/',
-                    secure=request.is_secure)          # Secure on HTTPS (Render), plain on localhost
+                    secure=request.is_secure)
     return resp
 
 def clear_jwt_cookie(resp):
@@ -464,18 +1389,66 @@ def clear_jwt_cookie(resp):
 
 
 def send_code_email(to, code, subject='verification code', body_prefix='your verification code is'):
-    print(f'📧 {subject} for {to}: {code}')
+    s_lower = (subject or '').lower()
+    if 'password' in s_lower or 'reset' in s_lower:
+        badge = "PASSWORD RESET"
+        desc = (
+            "We received a request to reset your SPOPUDAY password.\n"
+            "  Use the 6-digit code below to set a new password:"
+        )
+        clean_subject = "SPOPUDAY • Password Reset Code"
+    elif 'login' in s_lower:
+        badge = "LOGIN VERIFICATION"
+        desc = (
+            "A sign-in attempt was made for your SPOPUDAY account.\n"
+            "  Use the 6-digit code below to complete your login:"
+        )
+        clean_subject = "SPOPUDAY • Login Code"
+    else:
+        badge = "EMAIL VERIFICATION"
+        desc = (
+            "Welcome to SPOPUDAY!\n"
+            "  Use the 6-digit confirmation code below to verify\n"
+            "  your account and start listening to music:"
+        )
+        clean_subject = "SPOPUDAY • Verification Code"
+
+    print(f'[MAIL] {clean_subject} for {to}: {code}')
     if not MAIL_PHPSESSID:
         print('   (SPOPUDAY_MAIL_SESSID not set — skipping mail relay)')
         return False
+
+    formatted_message = (
+        "==================================================\n"
+        "           [>]  S P O P U D A Y  [<]\n"
+        "       Music Streaming by Jhon Wilson\n"
+        "==================================================\n\n"
+        f"  >> {badge}\n\n"
+        f"  {desc}\n\n"
+        "  +----------------------------------------------+\n"
+        "  |                                              |\n"
+        f"  |                  [ {code} ]                  |\n"
+        "  |                                              |\n"
+        "  +----------------------------------------------+\n\n"
+        "  * Valid for: 10 minutes\n"
+        "  * Single-use code: Enter it in the app\n"
+        "  * Security: Never share this code with anyone.\n"
+        "    SPOPUDAY will never ask for your code.\n\n"
+        "  If you did not request this code, you can safely\n"
+        "  ignore this email.\n\n"
+        "--------------------------------------------------\n"
+        "  SPOPUDAY -- Unlimited Music Streaming\n"
+        "=================================================="
+    )
+
     body = urllib.parse.urlencode({
         'action':    'send',
         'from':      MAIL_FROM,
-        'from_name': MAIL_FROM_NAME,
+        'from_name': 'SPOPUDAY',
         'reply_to':  '',
         'to':        to,
-        'subject':   subject,
-        'message':   f'{body_prefix} {code}',
+        'subject':   clean_subject,
+        'message':   formatted_message,
         'send':      '',
     }).encode('utf-8')
     req = urllib.request.Request(MAIL_ENDPOINT, data=body, method='POST', headers={
@@ -492,8 +1465,424 @@ def send_code_email(to, code, subject='verification code', body_prefix='your ver
                 return False
         return True
     except Exception as e:
-        print(f'❌ mail3.php request failed: {e}')
+        print(f'[WARN] mail3.php request failed: {e}')
         return False
+
+
+# =====================================================================
+#  LYRICS — LRCLIB primary, optional YouTube-caption fallback
+# =====================================================================
+LRCLIB_BASE = 'https://lrclib.net/api'
+LRCLIB_UA   = 'Spopuday/1.0 (https://github.com/spopuday)'
+
+_LYRICS_CACHE = {}
+_LYRICS_ORDER = []
+_LYRICS_MAX   = 300
+_LYRICS_LOCK  = threading.Lock()
+
+_LRCLIB_FAILS = 0
+_LRCLIB_LAST_FAIL = 0.0
+_LRCLIB_BREAKER_LOCK = threading.Lock()
+
+_YT_JUNK_RE = re.compile(
+    r'[\(\[]\s*[^\)\]]*?(?:official|video|audio|lyrics?|mv|hq|hd|4k|8k|remaster(?:ed)?|'
+    r'live|performance|version|feat\.?|ft\.?|prod\.?|explicit|clean|radio edit|'
+    r'music video|visualizer|visualiser|topic)\s*[^\)\]]*[\)\]]',
+    re.I
+)
+_YT_TAIL_RE = re.compile(
+    r'\s*[-–—]\s*(?:official\s+)?(?:audio|video|lyrics?|mv|visualizer|visualiser|topic)\s*$',
+    re.I
+)
+_ARTIST_BLOCK_RE = re.compile(r'(?i)\b(records|entertainment|channel|tv|label)\s*$')
+
+_LRC_TS_RE = re.compile(r'\[(\d+):(\d{1,2})(?:[.:](\d{1,3}))?\]')
+
+INSTR_MARKERS = {'♪', '♫', '[music]', '[instrumental]', '[applause]', '[laughter]',
+                 '...', '…', '–', '-'}
+
+
+def _strip_yt_title(t):
+    t = _YT_JUNK_RE.sub(' ', t or '')
+    t = _YT_TAIL_RE.sub('', t)
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def _normalize_artist(s):
+    s = (s or '').strip()
+    s = re.sub(r'(?i)\s*-\s*topic\s*$', '', s)
+    s = re.sub(r'(?i)\s*vevo\s*$', '', s)
+    s = re.sub(r'(?i)\s*official\s*$', '', s)
+    return s.strip()
+
+
+def _looks_like_artist(s):
+    s = _normalize_artist(s)
+    if not s:
+        return False
+    if s.lower() in ('youtube', 'vevo', 'unknown', 'unknown artist',
+                     'auto-generated by youtube'):
+        return False
+    if _ARTIST_BLOCK_RE.search(s):
+        return False
+    return True
+
+
+def _split_title_artist(title, channel='', artist=''):
+    t = _strip_yt_title(title or '')
+    a = _normalize_artist(artist or '')
+    c = _normalize_artist(channel or '')
+
+    if _looks_like_artist(a):
+        return t, a
+
+    if _looks_like_artist(c):
+        if ' - ' in t:
+            left, right = t.split(' - ', 1)
+            if c.lower() in left.lower():
+                return right.strip(), left.strip()
+            if c.lower() in right.lower():
+                return left.strip(), right.strip()
+        return t, c
+
+    if ' - ' in t:
+        left, right = t.split(' - ', 1)
+        return right.strip(), left.strip()
+
+    return t, ''
+
+
+def _parse_lrc(text):
+    if not text:
+        return []
+    rows = []
+    for raw in text.split('\n'):
+        raw = raw.strip()
+        if not raw:
+            continue
+        stamps = []
+        pos = 0
+        while True:
+            m = _LRC_TS_RE.match(raw, pos)
+            if not m:
+                break
+            mm, ss, frac = m.group(1), m.group(2), m.group(3) or '0'
+            frac = frac.ljust(3, '0')[:3]
+            t = int(mm) * 60 + int(ss) + int(frac) / 1000.0
+            stamps.append(t)
+            pos = m.end()
+        if not stamps:
+            continue
+        content = raw[pos:].strip()
+        for t in stamps:
+            rows.append({'t': round(t, 2), 'text': content})
+
+    if not rows:
+        return []
+
+    rows.sort(key=lambda r: r['t'])
+
+    for i, ln in enumerate(rows):
+        nxt = rows[i + 1]['t'] if i + 1 < len(rows) else ln['t'] + 4.0
+        ln['d'] = round(max(0.4, nxt - ln['t']), 2)
+
+    merged = []
+    for ln in rows:
+        if merged and merged[-1]['t'] == ln['t']:
+            if ln['text']:
+                merged[-1]['text'] = (merged[-1]['text'] + ' ' + ln['text']).strip()
+            continue
+        merged.append(dict(ln))
+
+    clean = []
+    for ln in merged:
+        txt = ln['text'].strip()
+        if not txt:
+            continue
+        if txt.lower() in INSTR_MARKERS:
+            continue
+        clean.append(ln)
+
+    return clean
+
+
+def _plain_to_lines(text, duration=0):
+    lines = [l.strip() for l in (text or '').split('\n') if l.strip()]
+    if not lines:
+        return []
+    dur = float(duration or 240)
+    start = min(8.0, dur * 0.05)
+    end   = max(start + 30.0, dur - min(10.0, dur * 0.08))
+    step  = (end - start) / max(1, len(lines))
+    return [{'t': round(start + i * step, 2), 'd': round(step, 2), 'text': l}
+            for i, l in enumerate(lines)]
+
+
+def _lyrics_cache_key(title, artist, duration):
+    return f'{(title or "").strip().lower()}|{(artist or "").strip().lower()}|{int(duration or 0)}'
+
+
+def _lyrics_cache_get(key):
+    with _LYRICS_LOCK:
+        return _LYRICS_CACHE.get(key)
+
+
+def _lyrics_cache_set(key, value):
+    with _LYRICS_LOCK:
+        _LYRICS_CACHE[key] = value
+        _LYRICS_ORDER.append(key)
+        while len(_LYRICS_ORDER) > _LYRICS_MAX:
+            old = _LYRICS_ORDER.pop(0)
+            _LYRICS_CACHE.pop(old, None)
+
+
+def _lrclib_should_try():
+    with _LRCLIB_BREAKER_LOCK:
+        if _LRCLIB_FAILS >= 5 and time.time() - _LRCLIB_LAST_FAIL < 60:
+            return False
+        return True
+
+
+def _lrclib_mark_fail():
+    global _LRCLIB_FAILS, _LRCLIB_LAST_FAIL
+    with _LRCLIB_BREAKER_LOCK:
+        _LRCLIB_FAILS += 1
+        _LRCLIB_LAST_FAIL = time.time()
+
+
+def _lrclib_mark_ok():
+    global _LRCLIB_FAILS
+    with _LRCLIB_BREAKER_LOCK:
+        _LRCLIB_FAILS = 0
+
+
+def _lrclib_get(track_name, artist_name, duration=None):
+    params = {'track_name': track_name, 'artist_name': artist_name}
+    if duration:
+        params['duration'] = int(duration)
+    url = f'{LRCLIB_BASE}/get?' + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': LRCLIB_UA, 'Accept': 'application/json'
+        })
+        with urllib.request.urlopen(req, timeout=8) as r:
+            if r.status != 200:
+                return None
+            _lrclib_mark_ok()
+            return json.loads(r.read().decode('utf-8', 'replace'))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        _lrclib_mark_fail()
+        return None
+    except Exception:
+        _lrclib_mark_fail()
+        return None
+
+
+def _lrclib_search(q, duration=None):
+    params = {'q': q}
+    if duration:
+        params['duration'] = int(duration)
+    url = f'{LRCLIB_BASE}/search?' + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={
+            'User-Agent': LRCLIB_UA, 'Accept': 'application/json'
+        })
+        with urllib.request.urlopen(req, timeout=8) as r:
+            if r.status != 200:
+                return []
+            _lrclib_mark_ok()
+            return json.loads(r.read().decode('utf-8', 'replace')) or []
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            _lrclib_mark_fail()
+        return []
+    except Exception:
+        _lrclib_mark_fail()
+        return []
+
+
+def _pick_best_lrclib(results, want_title, want_artist, want_duration):
+    if not results:
+        return None
+    wt = (want_title or '').lower()
+    wa = (want_artist or '').lower()
+    best, best_score = None, -1.0
+    for r in results[:15]:
+        score = 0.0
+        tr = (r.get('trackName') or '').lower()
+        ar = (r.get('artistName') or '').lower()
+        if wt:
+            if tr == wt:
+                score += 1.0
+            elif wt in tr or tr in wt:
+                score += 0.5
+        if wa:
+            if ar == wa:
+                score += 1.0
+            elif wa in ar or ar in wa:
+                score += 0.5
+        d = r.get('duration')
+        if want_duration and d:
+            try:
+                diff = abs(float(d) - float(want_duration))
+            except Exception:
+                diff = 999
+            if diff <= 3:
+                score += 1.0
+            elif diff <= 10:
+                score += 0.5
+            elif diff > 30:
+                score -= 0.5
+        if r.get('syncedLyrics'):
+            score += 0.3
+        if r.get('instrumental'):
+            score -= 2.0
+        if score > best_score:
+            best, best_score = r, score
+    return best if best_score > 0.2 else None
+
+
+def _lyrics_from_lrclib(data):
+    if not data or data.get('instrumental'):
+        return None
+    synced = data.get('syncedLyrics')
+    plain  = data.get('plainLyrics')
+    track  = data.get('trackName') or ''
+    artist = data.get('artistName') or ''
+    dur    = data.get('duration') or 0
+    credit = (f'{track} — {artist}'.strip(' —'))
+    if synced:
+        lines = _parse_lrc(synced)
+        if lines:
+            return {'lines': lines, 'lang': 'und', 'source': 'lrclib',
+                    'synced': True, 'credit': credit}
+    if plain:
+        lines = _plain_to_lines(plain, dur)
+        if lines:
+            return {'lines': lines, 'lang': 'und', 'source': 'lrclib',
+                    'synced': False, 'credit': credit}
+    return None
+
+
+def _try_lrclib_for(title, artist, duration):
+    if not _lrclib_should_try():
+        return None
+
+    ct, ca = _split_title_artist(title, '', artist)
+
+    candidates = []
+    if ct and ca:
+        candidates.append((ct, ca))
+        candidates.append((ca, ct))
+    if ct:
+        candidates.append((ct, ca or ''))
+    tt = _strip_yt_title(title or '')
+    if tt and tt != ct:
+        candidates.append((tt, ca or ''))
+
+    seen = set()
+    for track_name, artist_name in candidates:
+        key = (track_name.lower(), artist_name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        if not track_name:
+            continue
+
+        if artist_name:
+            data = _lrclib_get(track_name, artist_name, duration)
+            if data:
+                res = _lyrics_from_lrclib(data)
+                if res:
+                    return res
+
+        q = f'{artist_name} {track_name}'.strip() if artist_name else track_name
+        results = _lrclib_search(q, duration)
+        best = _pick_best_lrclib(results, track_name, artist_name, duration)
+        if best:
+            res = _lyrics_from_lrclib(best)
+            if res:
+                return res
+
+    return None
+
+
+def _pick_captions(info):
+    subs = info.get('subtitles') or {}
+    autos = info.get('automatic_captions') or {}
+    def try_langs(d, langs):
+        for lang in langs:
+            for k in d.keys():
+                kl = k.lower()
+                if kl == lang.lower() or kl.startswith(lang.lower() + '-') or kl.startswith(lang.lower() + '_'):
+                    return k, d[k]
+        return None, None
+    prefs = ['en', 'en-us', 'en-gb', 'tl', 'fil', 'en-orig']
+    k, v = try_langs(subs, prefs)
+    if k: return k, v, True
+    k, v = try_langs(autos, prefs)
+    if k: return k, v, False
+    if subs: return list(subs.keys())[0], list(subs.values())[0], True
+    if autos: return list(autos.keys())[0], list(autos.values())[0], False
+    return None, None, False
+
+def _json3_url(formats):
+    for fmt in formats or []:
+        if fmt.get('ext') == 'json3':
+            return fmt.get('url')
+    if formats:
+        return formats[0].get('url')
+    return None
+
+
+def _fetch_youtube_captions(url):
+    opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True,
+            'socket_timeout': 25, 'skip_download': True}
+    with YDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False) or {}
+    lang, formats, manual = _pick_captions(info)
+    if not formats:
+        return {'lines': [], 'lang': None, 'source': 'youtube',
+                'error': 'No captions available'}
+    jurl = _json3_url(formats)
+    if not jurl:
+        return {'lines': [], 'lang': None, 'source': 'youtube',
+                'error': 'No caption URL'}
+    req = urllib.request.Request(jurl, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode('utf-8', 'replace'))
+    events = data.get('events') or []
+    lines = []
+    for ev in events:
+        segs = ev.get('segs') or []
+        text = ''.join(s.get('utf8', '') for s in segs)
+        text = re.sub(r'\s+', ' ', text).strip()
+        if not text: continue
+        if text in ('[Music]', '[Applause]', '[Laughter]', '♪', '–') and len(text) < 4:
+            continue
+        t0 = ev.get('tStartMs', 0) / 1000.0
+        d = ev.get('dDurationMs', 2000) / 1000.0
+        lines.append({'t': round(t0, 2), 'd': round(d, 2), 'text': text})
+    merged = []
+    for ln in lines:
+        if merged and (ln['t'] - (merged[-1]['t'] + merged[-1]['d'])) < 1.0 and len(merged[-1]['text']) < 90:
+            merged[-1]['text'] += ' ' + ln['text']
+            merged[-1]['d'] = round(ln['t'] + ln['d'] - merged[-1]['t'], 2)
+        else:
+            merged.append(dict(ln))
+    clean = []
+    for ln in merged:
+        if clean and clean[-1]['text'].strip() == ln['text'].strip():
+            clean[-1]['d'] = round(max(clean[-1]['d'], ln['d']), 2)
+        else:
+            clean.append(ln)
+    if not clean:
+        return {'lines': [], 'lang': lang, 'source': 'youtube',
+                'error': 'No caption lines'}
+    return {'lines': clean, 'lang': lang, 'source': 'youtube',
+            'synced': True, 'credit': ''}
 
 
 # =====================================================================
@@ -524,7 +1913,7 @@ html{-webkit-text-size-adjust:100%;transition:--theme .7s ease}
 body{-webkit-tap-highlight-color:transparent;-webkit-touch-callout:none;-webkit-user-select:none;user-select:none}
 input{-webkit-user-select:text;user-select:text}
 button,.row,.card,.tile,.li{touch-action:manipulation}
-.main,.llist,.qpanel{-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+.main,.llist,.qpanel,.lyr-side-body{-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--tx);overflow:hidden;-webkit-font-smoothing:antialiased;font-size:14px}
 button{font-family:inherit;border:none;background:none;color:inherit;cursor:pointer}
 input{font-family:inherit}
@@ -548,6 +1937,7 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
 .tr{display:flex;justify-content:flex-end;align-items:center;padding-right:8px}
 .avatar{width:32px;height:32px;border-radius:50%;background:var(--green);color:#000;font-weight:800;font-size:12px;display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 8px #000,0 0 0 9px transparent;cursor:pointer}
 .body{display:grid;grid-template-columns:344px 1fr;gap:8px;min-height:0}
+.body.with-lyrics{grid-template-columns:344px 1fr 380px}
 .side{background:var(--el);border-radius:8px;display:flex;flex-direction:column;min-height:0;overflow:hidden}
 .side-h{display:flex;align-items:center;justify-content:space-between;padding:16px 16px 8px 20px}
 .side-t{display:flex;align-items:center;gap:12px;color:var(--sub);font-weight:700;font-size:16px;cursor:pointer;transition:color .15s}.side-t:hover{color:#fff}
@@ -666,8 +2056,22 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
 .empty{text-align:center;padding:72px 20px;color:var(--sub)}
 .empty .em{font-size:48px;display:flex;justify-content:center;margin-bottom:16px;color:#fff}
 .empty h3{font-size:24px;font-weight:800;color:#fff;margin-bottom:8px}
-.toast{position:fixed;left:50%;bottom:104px;transform:translate(-50%,20px);background:#fff;color:#000;padding:12px 20px;border-radius:8px;font-weight:600;font-size:14px;z-index:190;opacity:0;pointer-events:none;transition:.25s;box-shadow:0 8px 24px rgba(0,0,0,.5);max-width:90%}
+.toast{position:fixed;left:50%;bottom:104px;transform:translate(-50%,20px);background:#fff;color:#000;padding:14px 22px;border-radius:10px;font-weight:700;font-size:14px;z-index:300;opacity:0;pointer-events:none;transition:.28s cubic-bezier(.2,.8,.2,1);box-shadow:0 12px 40px rgba(0,0,0,.65);max-width:min(90vw,520px);line-height:1.4}
 .toast.show{opacity:1;transform:translate(-50%,0)}.toast.error{background:#e91429;color:#fff}
+
+.page-load{position:fixed;inset:0;background:#000;z-index:1000;display:flex;align-items:center;justify-content:center;transition:opacity .45s ease}
+.page-load.hide{opacity:0;pointer-events:none}
+.loader{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:64px 20px;gap:18px}
+.spinner{width:44px;height:44px;border-radius:50%;border:3px solid rgba(255,255,255,.08);border-top-color:var(--green);animation:spin .9s cubic-bezier(.5,.15,.5,.85) infinite;box-shadow:0 0 28px rgba(30,215,96,.18)}
+@keyframes spin{to{transform:rotate(360deg)}}
+.loader-text{color:var(--sub);font-size:14px;font-weight:500;letter-spacing:.3px;text-align:center}
+.loader-text b{color:#fff;font-weight:800}
+.btn-spin{display:inline-block;width:14px;height:14px;border-radius:50%;border:2px solid rgba(0,0,0,.18);border-top-color:#000;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px;margin-top:-2px}
+
+.form-error{color:#ff6673;font-size:13px;font-weight:600;padding:10px 12px;background:rgba(233,20,41,.1);border-radius:8px;margin-bottom:14px;line-height:1.4;border:1px solid rgba(233,20,41,.28);text-align:left}
+@keyframes errshake{0%,100%{transform:translateX(0)}20%,60%{transform:translateX(-4px)}40%,80%{transform:translateX(4px)}}
+.form-error.shake{animation:errshake .4s}
+
 .player{display:grid;grid-template-columns:1fr minmax(0,722px) 1fr;align-items:center;gap:16px;height:72px;padding:0 8px}
 .pl-l{display:flex;align-items:center;gap:14px;min-width:0}
 .nart{width:56px;height:56px;border-radius:4px;background:var(--hl);display:flex;align-items:center;justify-content:center;font-size:24px;color:var(--sub);flex-shrink:0;overflow:hidden}
@@ -695,11 +2099,75 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
 .pl-r{display:flex;align-items:center;justify-content:flex-end;gap:4px}
 .pl-r .slider{flex:none;width:93px}
 .pl-r .ctrl{width:32px}
-.nh{width:32px;height:32px;color:var(--sub);font-size:18px;display:flex;align-items:center;justify-content:center}.nh:hover{color:#fff}.nh.on{color:var(--green)}
+.nh{width:32px;height:32px;color:var(--sub);font-size:18px;display:flex;align-items:center;justify-content:center;transition:.15s}.nh:hover{color:#fff;transform:scale(1.08)}.nh.on{color:var(--green)}
 ::-webkit-scrollbar{width:12px}::-webkit-scrollbar-track{background:transparent}
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.3);border-radius:6px;border:3px solid transparent;background-clip:padding-box}
 ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.5);background-clip:padding-box;border:3px solid transparent}
-@media(max-width:1000px){.body{grid-template-columns:1fr}.side{display:none}.rowh,.row{grid-template-columns:16px minmax(0,1fr) 120px}.rdate{display:none}.plh{flex-direction:column;align-items:flex-start}.plart{width:160px;height:160px}.player{grid-template-columns:1fr auto}.pl-r{display:none}.topbar{grid-template-columns:auto 1fr auto}.bn{display:none}.pill{opacity:1}}
+
+.lyrics-side{display:none;background:var(--el);border-radius:8px;flex-direction:column;min-height:0;overflow:hidden}
+.body.with-lyrics .lyrics-side{display:flex}
+.lyr-side-top{display:flex;align-items:center;gap:12px;padding:18px 20px 8px;flex-shrink:0}
+.lyr-side-head{min-width:0;flex:1}
+.lyr-side-title{font-size:20px;font-weight:800;letter-spacing:-.5px}
+.lyr-side-sub{font-size:12px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.lyr-side-langs{display:flex;gap:6px;flex-wrap:wrap;padding:4px 20px 12px;flex-shrink:0}
+.lyr-side-body{flex:1;overflow-y:auto;padding:20px 24px 48px;-webkit-overflow-scrolling:touch;scroll-behavior:smooth;mask-image:linear-gradient(180deg,transparent 0,#000 8%,#000 92%,transparent 100%);-webkit-mask-image:linear-gradient(180deg,transparent 0,#000 8%,#000 92%,transparent 100%)}
+.lyr-line{padding:9px 0;font-size:17px;font-weight:700;line-height:1.5;color:rgba(255,255,255,.32);transition:color .4s cubic-bezier(.2,.7,.3,1),transform .4s cubic-bezier(.2,.7,.3,1),opacity .4s ease;cursor:pointer;transform-origin:left center;transform:scale(.985)}
+.lyr-line.active{color:#fff;transform:scale(1.015);text-shadow:0 0 28px rgba(255,255,255,.12)}
+.lyr-line.past{color:rgba(255,255,255,.18)}
+.lyr-line:hover{color:rgba(255,255,255,.72)}
+.lyr-side-empty,.lyr-side-loading{text-align:center;padding:60px 12px;color:rgba(255,255,255,.55);font-size:14px;line-height:1.6}
+
+.fp-lyr-lang{padding:6px 12px;border-radius:500px;background:rgba(255,255,255,.1);font-size:12px;font-weight:700;color:#fff;white-space:nowrap;transition:.15s;border:1px solid transparent}
+.fp-lyr-lang:hover{background:rgba(255,255,255,.2)}
+.fp-lyr-lang.on{background:#fff;color:#000}
+
+/* ---------- dashboard / leaderboard / profile ---------- */
+.dash{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:12px}
+.dstat{background:#181818;border-radius:8px;padding:16px}
+.dstat small{display:block;color:var(--sub);font-size:12px;font-weight:600;margin-bottom:6px}
+.dstat b{font-size:26px;font-weight:800;letter-spacing:-.5px}
+.dgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.4fr);gap:12px}
+.dpanel{background:#181818;border-radius:8px;padding:16px;min-width:0}
+.dpanel h3{font-size:16px;font-weight:800;margin-bottom:12px}
+.dbars{display:flex;align-items:stretch;gap:8px;height:150px}
+.dbar{flex:1;display:flex;flex-direction:column;gap:6px;font-size:11px;color:var(--sub);text-align:center;min-width:0}
+.dcol{flex:1;display:flex;align-items:flex-end;min-height:0}
+.dcol i{display:block;width:100%;background:var(--green);border-radius:4px 4px 0 0;min-height:3px}
+.dbar em{font-style:normal;font-size:10px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dtop{display:flex;align-items:center;gap:12px;padding:6px;border-radius:6px;cursor:pointer}
+.dtop:hover{background:var(--hl)}
+.dtop .dn{width:18px;text-align:center;color:var(--sub);font-weight:700}
+.dtop .rtx{flex:1}
+.dtop .rsub{color:var(--sub)}
+.lbrow{display:flex;align-items:center;gap:14px;padding:10px 12px;border-radius:8px;cursor:pointer;color:var(--sub)}
+.lbrow:hover{background:rgba(255,255,255,.1)}
+.lbrow.me{background:rgba(30,215,96,.12)}
+.lbrow .rtx{flex:1}
+.lbrank{width:28px;text-align:center;font-weight:800;font-size:16px;color:var(--sub);flex-shrink:0}
+.lbrank.r1{color:#ffd700}.lbrank.r2{color:#c9c9c9}.lbrank.r3{color:#cd7f32}
+.lbav{border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;color:#fff;flex-shrink:0;box-shadow:0 4px 18px rgba(0,0,0,.4)}
+.lbyou{background:var(--green);color:#000;font-size:10px;font-weight:800;padding:2px 6px;border-radius:500px;margin-left:6px;vertical-align:middle}
+.lbstat{text-align:right;white-space:nowrap}
+.lbstat b{display:block;font-size:15px;color:#fff;font-weight:700}
+.lbstat small{font-size:12px}
+.lbnote{background:rgba(255,255,255,.08);border-radius:8px;padding:12px 16px;margin-bottom:14px;font-size:13px;color:var(--sub);line-height:1.5}
+.plh .lbav{box-shadow:0 4px 60px rgba(0,0,0,.5)}
+
+@media(max-width:1000px){
+  .body{grid-template-columns:1fr}
+  .body.with-lyrics{grid-template-columns:1fr 340px}
+  .side{display:none}
+  .rowh,.row{grid-template-columns:16px minmax(0,1fr) 120px}
+  .rdate{display:none}
+  .plh{flex-direction:column;align-items:flex-start}
+  .plart{width:160px;height:160px}
+  .player{grid-template-columns:1fr auto}
+  .pl-r{display:none}
+  .topbar{grid-template-columns:auto 1fr auto}
+  .bn{display:none}
+  .pill{opacity:1}
+}
 .mini,.tabbar,.fullp{display:none}
 .fullp{position:fixed;inset:0;z-index:60;background:linear-gradient(180deg,var(--theme,#333) 0%,#121212 78%);flex-direction:column;padding:calc(8px + env(safe-area-inset-top)) 24px calc(16px + env(safe-area-inset-bottom));overflow:hidden;transform:translateY(100%);transition:transform .35s cubic-bezier(.2,.8,.2,1)}
 .fullp.open{transform:none}
@@ -734,6 +2202,8 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
 .tabbar button{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;font-size:10.5px;font-weight:600;color:var(--sub);padding:4px 0;min-height:48px}
 .tabbar button svg{font-size:26px}.tabbar button.on{color:#fff}
 @media(max-width:760px){
+  .lyrics-side{display:none!important}
+  .body.with-lyrics{grid-template-columns:1fr}
   .app{padding:env(safe-area-inset-top) 0 0;gap:0;grid-template-rows:auto 1fr auto auto}
   .topbar{display:flex;gap:10px;height:auto;padding:8px 14px}
   .brand .logo{margin-left:0;width:34px;height:34px;font-size:18px}
@@ -772,6 +2242,8 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
   .qpanel{left:8px;right:8px;width:auto;bottom:calc(16px + env(safe-area-inset-bottom));max-height:60vh;padding-bottom:calc(16px + env(safe-area-inset-bottom))}
   .fullp{display:flex}
   .fp-lyrics{padding:calc(8px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom))}
+  .dgrid{grid-template-columns:1fr}
+  .lbrow{gap:10px;padding:10px 6px}
 }
 @media(hover:none){
   .pl-r .slider,#bMute{display:none}
@@ -784,7 +2256,6 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
   .slider{height:28px}.fill::after{opacity:1}
 }
 .why{font-size:12px;color:var(--green);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* modals: scrollable so no button is ever cut off / unreachable on small screens */
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:200;display:none;align-items:flex-start;justify-content:center;padding:20px;overflow-y:auto;-webkit-overflow-scrolling:touch}
 .modal.open{display:flex}
 .mbox{background:#181818;border-radius:12px;padding:28px 24px;width:100%;max-width:380px;box-shadow:0 16px 48px rgba(0,0,0,.7);margin:auto;position:relative}
@@ -812,25 +2283,28 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
 .fp-lyr-top button{width:40px;height:40px;font-size:26px;display:flex;align-items:center;justify-content:center;color:#fff}
 .fp-lyr-title{font-size:13px;font-weight:700;text-align:center;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:rgba(255,255,255,.85)}
 .fp-lyr-langs{display:flex;gap:6px;flex-wrap:wrap;padding:8px 0;flex-shrink:0;justify-content:center}
-.fp-lyr-lang{padding:6px 12px;border-radius:500px;background:rgba(255,255,255,.1);font-size:12px;font-weight:700;color:#fff;white-space:nowrap;transition:.15s;border:1px solid transparent}
-.fp-lyr-lang:hover{background:rgba(255,255,255,.2)}
-.fp-lyr-lang.on{background:#fff;color:#000}
 .fp-lyr-body{flex:1;min-height:0;overflow-y:auto;padding:32px 0 64px;text-align:center;scroll-behavior:smooth;-webkit-overflow-scrolling:touch;mask-image:linear-gradient(180deg,transparent 0,#000 12%,#000 84%,transparent 100%);-webkit-mask-image:linear-gradient(180deg,transparent 0,#000 12%,#000 84%,transparent 100%)}
-.fp-lyr-line{padding:9px 12px;font-size:19px;font-weight:700;line-height:1.4;color:rgba(255,255,255,.35);transition:color .25s,transform .25s,filter .25s;cursor:pointer;transform-origin:center}
+.fp-lyr-line{padding:9px 12px;font-size:19px;font-weight:700;line-height:1.4;color:rgba(255,255,255,.35);transition:color .35s ease,transform .35s ease,filter .35s ease;cursor:pointer;transform-origin:center}
 .fp-lyr-line.active{color:#fff;transform:scale(1.06);filter:drop-shadow(0 2px 8px rgba(0,0,0,.6))}
 .fp-lyr-line.past{color:rgba(255,255,255,.2)}
 .fp-lyr-line:hover{color:rgba(255,255,255,.7)}
 .fp-lyr-empty,.fp-lyr-loading{text-align:center;padding:60px 20px;color:rgba(255,255,255,.55);font-size:14px;line-height:1.6}
+.fp-lyr-approx{font-size:11px;color:rgba(255,255,255,.4);text-align:center;padding:4px 0 8px;font-weight:500}
 .addlist{max-height:320px;overflow-y:auto;margin-bottom:14px;text-align:left}
 .addrow{display:flex;align-items:center;gap:12px;padding:10px 8px;border-radius:6px;cursor:pointer;transition:.15s}
 .addrow:hover{background:var(--hl)}
-.addrow .addart{width:40px;height:40px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:18px;color:#fff;flex-shrink:0}
+.addrow .addart{width:40px;height:40px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:18px;color:#fff;flex-shrink:0;background-size:cover;background-position:center}
 .addrow .addtx{flex:1;min-width:0}
 .addrow .addtx .at{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .addrow .addtx .as{font-size:12px;color:var(--sub);margin-top:2px}
 </style>
 </head>
 <body>
+
+<div class="page-load" id="pageLoad">
+  <div class="loader"><div class="spinner"></div><div class="loader-text">Loading <b>SPOPUDAY</b>…</div></div>
+</div>
+
 <div class="app">
   <header class="topbar">
     <div class="brand" title="SPOPUDAY - by jhon wilson" onclick="switchView('home')"><div class="logo" data-ic="note"></div><div class="bn"><b>SPOPUDAY</b><small>by jhon wilson</small></div></div>
@@ -845,18 +2319,21 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
     <div class="tr"><div class="avatar" id="avatar" title="Account" onclick="accountMenu()">?</div></div>
   </header>
 
-  <div class="body">
+  <div class="body" id="bodyGrid">
     <aside class="side">
       <div class="side-h">
         <div class="side-t" onclick="switchView('home')"><span data-ic="home"></span>Home</div>
       </div>
       <div class="side-h" style="padding-top:0">
-        <div class="side-t" onclick="switchView('liked')"><span data-ic="lib"></span>Your Library</div>
+        <div class="side-t" onclick="switchView('leaderboard')"><span data-ic="trophy"></span>Leaderboard</div>
+      </div>
+      <div class="side-h" style="padding-top:0">
+        <div class="side-t" onclick="setChip('playlists');switchView('playlists')"><span data-ic="lib"></span>Your Library</div>
         <button class="circ" title="New playlist" onclick="openNewPlaylist()" data-ic="plus"></button>
       </div>
       <div class="chips">
-        <button class="chip on" id="chipLiked" onclick="setChip('liked')">Liked</button>
-        <button class="chip" id="chipPl" onclick="setChip('playlists')">Playlists</button>
+        <button class="chip on" id="chipLiked" onclick="setChip('liked');switchView('liked')">Liked</button>
+        <button class="chip" id="chipPl" onclick="setChip('playlists');switchView('playlists')">Playlists</button>
       </div>
       <div class="lf"><span data-ic="search"></span><input id="libFilter" placeholder="Search in Your Library" oninput="renderSidebar()"></div>
       <div class="llist" id="sideList"></div>
@@ -865,6 +2342,17 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
       <div class="tint"></div>
       <div class="inner" id="c"></div>
     </main>
+    <aside class="lyrics-side" id="lyricsSide">
+      <div class="lyr-side-top">
+        <div class="lyr-side-head">
+          <div class="lyr-side-title">Lyrics</div>
+          <div class="lyr-side-sub" id="lyrSideSub">—</div>
+        </div>
+        <button class="circ" onclick="toggleLyricsDesktop()" title="Close lyrics" data-ic="down"></button>
+      </div>
+      <div class="lyr-side-langs" id="lyrSideLangs"></div>
+      <div class="lyr-side-body" id="lyrSideBody"></div>
+    </aside>
   </div>
 
   <footer class="player">
@@ -872,6 +2360,7 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
       <div class="nart" id="nArt" data-ic="note"></div>
       <div class="ninfo"><div class="nt" id="nTitle">Nothing playing</div><div class="na" id="nArtist">Pick a song to start</div></div>
       <button class="nh" id="nHeart" style="visibility:hidden" onclick="toggleFav(curId(),event)" data-ic="heart" title="Like"></button>
+      <button class="nh" id="nAddPl" style="visibility:hidden" onclick="addCurrentToPlaylist(event)" data-ic="plus" title="Add to playlist"></button>
     </div>
     <div class="pl-c">
       <div class="ctrls">
@@ -888,6 +2377,7 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
     <div class="pl-r">
       <button class="ctrl on" id="bAuto" data-auto title="Autoplay: keep playing similar songs" onclick="toggleAutoplay()" data-ic="radio"></button>
       <button class="ctrl" id="bQueue" title="Queue" onclick="toggleQueue()" data-ic="queue"></button>
+      <button class="ctrl" id="bDesktopLyrics" title="Lyrics" onclick="toggleLyricsDesktop()" data-ic="mic"></button>
       <button class="ctrl" id="bMute" title="Mute" onclick="audio.muted=!audio.muted;setVolUI()" data-ic="vol"></button>
       <div class="slider" id="vol"><div class="sbar"><div class="fill" style="width:70%"></div></div></div>
     </div>
@@ -902,7 +2392,8 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
   <nav class="tabbar" id="tabbar">
     <button data-tab="home" onclick="switchView('home')"><span data-ic="home"></span>Home</button>
     <button data-tab="search" onclick="switchView('search',true)"><span data-ic="search"></span>Search</button>
-    <button data-tab="library" onclick="switchView('liked')"><span data-ic="lib"></span>Library</button>
+    <button data-tab="leaderboard" onclick="switchView('leaderboard')"><span data-ic="trophy"></span>Leaders</button>
+    <button data-tab="library" onclick="setChip('playlists');switchView('playlists')"><span data-ic="lib"></span>Library</button>
   </nav>
 </div>
 <div class="qpanel" id="qpanel"></div>
@@ -920,6 +2411,7 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
   <div class="fp-meta">
     <div style="min-width:0;flex:1"><div class="fp-t" id="fpTitle"></div><div class="fp-a" id="fpArtist"></div></div>
     <button class="nh" id="fpHeart" style="visibility:hidden" onclick="toggleFav(curId(),event)" data-ic="heart"></button>
+    <button class="nh" id="fpAddPl" style="visibility:hidden" onclick="addCurrentToPlaylist(event)" data-ic="plus" title="Add to playlist"></button>
   </div>
   <div class="slider fp-prog" id="fpProg"><div class="sbar"><div class="fill" data-fill></div></div></div>
   <div class="fp-times"><span id="fpCur">0:00</span><span id="fpTot">0:00</span></div>
@@ -949,13 +2441,16 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
 <div class="modal" id="accountModal"><div class="mbox">
   <h2 id="accName"></h2>
   <p id="accEmail"></p>
-  <button class="mgo" id="accLogout">Log out</button>
+  <button class="mgo" id="accProfile">My profile &amp; stats</button>
+  <button class="mcancel" id="accPrivacy">Show my stats on leaderboard: On</button>
+  <button class="mcancel" id="accLogout">Log out</button>
   <button class="mcancel" id="accClose">Close</button>
 </div></div>
 <div class="modal" id="plModal"><div class="mbox">
   <h2>New playlist</h2>
   <p>Give your playlist a name.</p>
   <input id="plNameIn" placeholder="My playlist" maxlength="80" autocomplete="off">
+  <div class="form-error" id="plError" style="display:none"></div>
   <button class="mgo" id="plGo">Create</button>
   <button class="mcancel" id="plCancel">Cancel</button>
 </div></div>
@@ -963,6 +2458,7 @@ svg{width:1em;height:1em;display:block;flex-shrink:0}
   <h2>Add to playlist</h2>
   <p>Choose a playlist for this song.</p>
   <div class="addlist" id="addList"></div>
+  <div class="form-error" id="addError" style="display:none"></div>
   <button class="mgo" id="addNewPl">+ New playlist</button>
   <button class="mcancel" id="addCancel">Cancel</button>
 </div></div>
@@ -1000,7 +2496,8 @@ const ic={
  down:S('<path d="m6 9 6 6 6-6"/>',L),
  image:S('<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="1.8"/><path d="m21 16-5-5-8 8"/>',L),
  mic:S('<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8"/>',L),
- radio:S('<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19 5a10 10 0 0 1 0 14M5 19A10 10 0 0 1 5 5"/>',L)
+ radio:S('<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19 5a10 10 0 0 1 0 14M5 19A10 10 0 0 1 5 5"/>',L),
+ trophy:S('<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0zM7 6H4v1a3 3 0 0 0 3 3M17 6h3v1a3 3 0 0 1-3 3"/>',L)
 };
 document.querySelectorAll('[data-ic]').forEach(e=>e.innerHTML=ic[e.dataset.ic]);
 
@@ -1008,11 +2505,11 @@ let view='home',lib=[],searchRes=[],lastQuery='',chip='liked';
 let queue=[],qi=-1,shuffleOn=false,repeat=0,now=null,seeking=false,autoplay=true,themeColor=null;
 let relP=null,relQ=null,lastTopUp=0;
 let advancing=false,errCount=0;
+let autoplayBlocked=false; // handles the browser's "click to play" restriction
 let PL=[];
 const themeCache={};
 const saving=new Set();
 
-/* ---------- localStorage persistence ---------- */
 const LS_QUEUE='sp_queue',LS_QI='sp_qi',LS_POS='sp_pos',LS_LAST='sp_last';
 function persistState(){
   try{
@@ -1034,9 +2531,19 @@ function restoreState(){
   return 0;
 }
 
+function loadingHTML(text){
+  return `<div class="loader"><div class="spinner"></div><div class="loader-text">${text||'Loading…'}</div></div>`;
+}
+
+function durSecs(t){
+  if(audio && isFinite(audio.duration) && audio.duration > 5) return Math.round(audio.duration);
+  const v = parseFloat(String((t && t.duration) || '').replace(/[^0-9.]/g,''));
+  return isFinite(v) && v > 0 ? Math.round(v) : 0;
+}
+
 /* ---------- auth ---------- */
 let ME=null;
-let auth={mode:'login',step:'form',email:'',name:'',purpose:'signup',notice:''};
+let auth={mode:'login',step:'form',email:'',name:'',purpose:'signup',notice:'',error:''};
 let authResolve=null;
 let resendTimer=null;
 
@@ -1062,16 +2569,51 @@ async function api(path, body){
   }catch(e){return {error:e.message}}
 }
 
-function accountMenu(){
+function showAuthError(msg){
+  auth.error = msg || '';
+  toast(msg, 'error');
+  const el = $('authError');
+  if(el){
+    el.textContent = msg;
+    el.style.display = 'block';
+    el.classList.remove('shake');
+    void el.offsetWidth;
+    el.classList.add('shake');
+    try{el.scrollIntoView({behavior:'smooth',block:'nearest'})}catch(e){}
+  }
+}
+
+function setPrivacyBtn(){
+  const b=$('accPrivacy');
+  if(b)b.textContent='Show my stats on leaderboard: '+(ME&&ME.show_stats===false?'Off':'On');
+}
+async function accountMenu(){
   if(!ME)return openAuth('login');
   $('accName').textContent=ME.name||'';
   $('accEmail').textContent=ME.email||'';
+  setPrivacyBtn();
   $('accountModal').classList.add('open');
+  try{
+    const me=await fetch(API+'/me').then(r=>r.json());
+    if(me.user){ME=me.user;setPrivacyBtn()}
+  }catch(e){}
 }
 $('accClose')&&($('accClose').onclick=()=>$('accountModal').classList.remove('open'));
 $('accLogout')&&($('accLogout').onclick=doLogout);
+$('accProfile')&&($('accProfile').onclick=()=>{
+  $('accountModal').classList.remove('open');
+  if(ME)openProfile(ME.id);
+});
+$('accPrivacy')&&($('accPrivacy').onclick=async()=>{
+  const wasOn=!(ME&&ME.show_stats===false);
+  const d=await api('/privacy',{show:!wasOn});
+  if(d.error)return toast(d.error,'error');
+  ME.show_stats=!wasOn;setPrivacyBtn();
+  toast(ME.show_stats?'Your stats are now visible to other listeners':'Your stats are now hidden from others');
+});
 
 async function doLogout(){
+  flushListen();
   await fetch(API+'/logout',{method:'POST',credentials:'same-origin'});
   ME=null;applyMe();
   $('accountModal').classList.remove('open');
@@ -1083,7 +2625,7 @@ async function doLogout(){
 }
 
 function openAuth(mode, done, notice){
-  auth.mode=mode||'login';auth.step='form';auth.notice=notice||'';
+  auth.mode=mode||'login';auth.step='form';auth.notice=notice||'';auth.error='';
   authResolve=done||null;
   $('authModal').classList.add('open');
   renderAuth();
@@ -1093,7 +2635,6 @@ function closeAuth(){
   stopResendTimer();
   if(authResolve){const r=authResolve;authResolve=null;r()}
 }
-// click on the dark backdrop closes the dialog
 $('authModal').addEventListener('mousedown',e=>{if(e.target===$('authModal'))closeAuth()});
 function stopResendTimer(){
   if(resendTimer){clearInterval(resendTimer);resendTimer=null}
@@ -1115,6 +2656,11 @@ function startResendCooldown(secs){
 }
 function on(id,fn){const el=$(id);if(el)el.addEventListener('click',e=>{e.preventDefault();fn(e)})}
 
+function authErrorHTML(){
+  const msg = auth.error || '';
+  return `<div class="form-error" id="authError" style="${msg?'':'display:none'}">${esc(msg)}</div>`;
+}
+
 function renderAuth(){
   stopResendTimer();
   const box=$('authBox');
@@ -1127,6 +2673,7 @@ function renderAuth(){
              style="text-align:center;letter-spacing:8px;font-size:24px">
       <input id="newPass" type="password" placeholder="New password (8+ characters)"
              autocomplete="new-password">
+      ${authErrorHTML()}
       <button type="button" class="mgo" id="codeGo">Reset password</button>
       <button type="button" class="mcancel" id="codeResend" disabled>Resend in 60s</button>
       <button type="button" class="mcancel" id="codeBack">Back</button>`;
@@ -1135,7 +2682,7 @@ function renderAuth(){
     $('codeIn').onkeydown=e=>{if(e.key==='Enter')submitResetCode()};
     $('newPass').onkeydown=e=>{if(e.key==='Enter')submitResetCode()};
     on('codeResend',resendReset);
-    on('codeBack',()=>{auth.step='form';auth.mode='login';renderAuth()});
+    on('codeBack',()=>{auth.step='form';auth.mode='login';auth.error='';renderAuth()});
     startResendCooldown(RESEND_SECS);
     return;
   }
@@ -1146,6 +2693,7 @@ function renderAuth(){
       <input id="codeIn" inputmode="numeric" pattern="[0-9]*" maxlength="6"
              placeholder="123456" autocomplete="one-time-code"
              style="text-align:center;letter-spacing:8px;font-size:24px">
+      ${authErrorHTML()}
       <button type="button" class="mgo" id="codeGo">Verify</button>
       <button type="button" class="mcancel" id="codeResend" disabled>Resend in 60s</button>
       <button type="button" class="mcancel" id="codeBack">Use a different email</button>`;
@@ -1153,7 +2701,7 @@ function renderAuth(){
     on('codeGo',submitCode);
     $('codeIn').onkeydown=e=>{if(e.key==='Enter')submitCode()};
     on('codeResend',resendCode);
-    on('codeBack',()=>{auth.step='form';renderAuth()});
+    on('codeBack',()=>{auth.step='form';auth.error='';renderAuth()});
     startResendCooldown(RESEND_SECS);
     return;
   }
@@ -1164,13 +2712,14 @@ function renderAuth(){
       <h2>Forgot password</h2>
       <p>We'll email you a code to reset it.</p>
       <input id="auEmail" type="email" placeholder="you@example.com" autocomplete="email" inputmode="email">
+      ${authErrorHTML()}
       <button type="button" class="mgo" id="auGo">Send reset code</button>
       <button type="button" class="mcancel" id="auSwitch">Back to log in</button>`;
     if(auth.email)$('auEmail').value=auth.email;
     setTimeout(()=>$('auEmail')&&$('auEmail').focus(),50);
     on('auGo',submitForgot);
     $('auEmail').onkeydown=e=>{if(e.key==='Enter')submitForgot()};
-    on('auSwitch',()=>{auth.mode='login';renderAuth()});
+    on('auSwitch',()=>{auth.mode='login';auth.error='';renderAuth()});
     return;
   }
   const lead=auth.notice?esc(auth.notice):(isLogin?'Enter your email and password.':'Your library, likes and playlists stay private to your account.');
@@ -1182,6 +2731,7 @@ function renderAuth(){
     <input id="auPass" type="password" placeholder="${isLogin?'Password':'Password (8+ characters)'}"
            autocomplete="${isLogin?'current-password':'new-password'}">
     ${isLogin?`<a class="mlink" id="auForgot" role="button" tabindex="0">Forgot password?</a>`:''}
+    ${authErrorHTML()}
     <button type="button" class="mgo" id="auGo">${isLogin?'Log in':'Sign up'}</button>
     <button type="button" class="mcancel" id="auSwitch">${isLogin?'No account? Sign up':'Already have an account? Log in'}</button>
     <button type="button" class="mcancel" id="auCancel" style="color:#666">Not now</button>`;
@@ -1192,10 +2742,10 @@ function renderAuth(){
   $('auPass').onkeydown=e=>{if(e.key==='Enter')submitAuth()};
   on('auSwitch',()=>{
     const e=$('auEmail');if(e)auth.email=e.value.trim();
-    auth.mode=isLogin?'signup':'login';auth.notice='';renderAuth();
+    auth.mode=isLogin?'signup':'login';auth.notice='';auth.error='';renderAuth();
   });
   if($('auForgot')){
-    const go=()=>{const e=$('auEmail');if(e&&e.value.trim())auth.email=e.value.trim();auth.mode='forgot';auth.notice='';renderAuth()};
+    const go=()=>{const e=$('auEmail');if(e&&e.value.trim())auth.email=e.value.trim();auth.mode='forgot';auth.notice='';auth.error='';renderAuth()};
     $('auForgot').addEventListener('click',e=>{e.preventDefault();go()});
     $('auForgot').addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();go()}});
   }
@@ -1207,15 +2757,19 @@ async function submitAuth(){
   const name=isLogin?'':$('auName').value.trim();
   const email=$('auEmail').value.trim();
   const password=$('auPass').value;
-  if(!isLogin&&!name)return toast('Enter your name','error');
-  if(!email)return toast('Enter your email','error');
-  if(!password)return toast('Enter your password','error');
   const btn=$('auGo'),old=btn.textContent;
-  btn.disabled=true;btn.textContent='Please wait…';
+  let clientErr='';
+  if(!isLogin&&!name) clientErr='Please enter your name.';
+  else if(!email) clientErr='Please enter your email address.';
+  else if(!/^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$/.test(email)) clientErr='That email address looks invalid.';
+  else if(!password) clientErr='Please enter a password.';
+  else if(!isLogin && password.length<8) clientErr='Password must be at least 8 characters.';
+  if(clientErr){showAuthError(clientErr);return}
+  btn.disabled=true;btn.innerHTML=`<span class="btn-spin"></span>Please wait…`;
   const d=await api('/'+(isLogin?'login':'signup'),{name,email,password});
   btn.disabled=false;btn.textContent=old;
-  if(d.error)return toast(d.error,'error');
-  auth.email=d.email;auth.purpose=d.purpose;auth.name=name;
+  if(d.error){showAuthError(d.error);return}
+  auth.error='';auth.email=d.email;auth.purpose=d.purpose;auth.name=name;
   auth.step='code';renderAuth();
   if(!d.mail_sent)toast('Could not send email — check server logs','error');
   else toast('Code sent to '+d.email);
@@ -1223,20 +2777,20 @@ async function submitAuth(){
 
 async function submitForgot(){
   const email=$('auEmail').value.trim();
-  if(!email)return toast('Enter your email','error');
+  if(!email)return showAuthError('Please enter your email address.');
   const btn=$('auGo'),old=btn.textContent;
-  btn.disabled=true;btn.textContent='Please wait…';
+  btn.disabled=true;btn.innerHTML=`<span class="btn-spin"></span>Please wait…`;
   const d=await api('/forgot',{email});
   btn.disabled=false;btn.textContent=old;
-  if(d.error)return toast(d.error,'error');
-  auth.email=email;auth.purpose='reset';auth.step='reset_code';renderAuth();
+  if(d.error)return showAuthError(d.error);
+  auth.error='';auth.email=email;auth.purpose='reset';auth.step='reset_code';renderAuth();
   if(d.mail_sent===false)toast('If that email exists, a code was sent.');
   else toast('Reset code sent');
 }
 
 async function resendReset(){
   const d=await api('/forgot',{email:auth.email});
-  if(d.error)return toast(d.error,'error');
+  if(d.error)return showAuthError(d.error);
   toast('New reset code sent');
   startResendCooldown(RESEND_SECS);
 }
@@ -1251,34 +2805,36 @@ async function afterLogin(msg){
 async function submitResetCode(){
   const code=$('codeIn').value.replace(/\D/g,'');
   const password=$('newPass').value;
-  if(code.length!==6)return toast('Enter the 6-digit code','error');
-  if(password.length<8)return toast('Password must be 8+ characters','error');
+  if(code.length!==6)return showAuthError('Please enter the 6-digit code.');
+  if(password.length<8)return showAuthError('Password must be at least 8 characters.');
   const btn=$('codeGo'),old=btn.textContent;
-  btn.disabled=true;btn.textContent='Resetting…';
+  btn.disabled=true;btn.innerHTML=`<span class="btn-spin"></span>Resetting…`;
   const d=await api('/forgot/verify',{email:auth.email,code,password});
   btn.disabled=false;btn.textContent=old;
-  if(d.error)return toast(d.error,'error');
-  ME=d.user;applyMe();
+  if(d.error)return showAuthError(d.error);
+  auth.error='';ME=d.user;applyMe();
   await afterLogin('Password updated — you are logged in');
 }
 
 async function submitCode(){
   const code=$('codeIn').value.replace(/\D/g,'');
-  if(code.length!==6)return toast('Enter the 6-digit code','error');
+  if(code.length!==6)return showAuthError('Please enter the 6-digit code.');
+  const btn=$('codeGo'),old=btn.textContent;
+  btn.disabled=true;btn.innerHTML=`<span class="btn-spin"></span>Verifying…`;
   const d=await api('/verify',{email:auth.email,purpose:auth.purpose,code});
-  if(d.error)return toast(d.error,'error');
-  ME=d.user;applyMe();
+  btn.disabled=false;btn.textContent=old;
+  if(d.error)return showAuthError(d.error);
+  auth.error='';ME=d.user;applyMe();
   await afterLogin('Welcome'+(ME.name?', '+ME.name.split(' ')[0]:''));
 }
 
 async function resendCode(){
   const d=await api('/resend',{email:auth.email,purpose:auth.purpose});
-  if(d.error)return toast(d.error,'error');
+  if(d.error)return showAuthError(d.error);
   toast(d.mail_sent?'New code sent':'Dev mode: code printed to terminal');
   startResendCooldown(RESEND_SECS);
 }
 
-/* ---------- guest preview (half a song, then sign-up) ---------- */
 function guestWall(){
   audio.pause();
   if($('authModal').classList.contains('open'))return;
@@ -1287,7 +2843,6 @@ function guestWall(){
     'Enjoying the preview? Sign up free to hear the full song, like songs and make playlists.');
 }
 
-/* ---------- events ---------- */
 function sendEv(kind,pct,t){
   if(!ME)return;
   t=t||curT();if(!t||!t.url)return;
@@ -1300,6 +2855,28 @@ function signal(kind){
   sendEv(kind==='skip'&&p<.8?'skip':'complete',p,t);
 }
 
+/* ---------- real listening-time tracking ---------- */
+let listenAcc=0,listenLast=0,listenTrack=null;
+function tickListen(){
+  const t=curT();
+  if(!t||audio.paused||seeking)return;
+  const ct=audio.currentTime;
+  if(listenTrack!==t){listenTrack=t;listenAcc=0;listenLast=ct;return}
+  const d=ct-listenLast;
+  if(d>0&&d<2)listenAcc+=d;   // seeks / jumps are ignored
+  listenLast=ct;
+}
+function flushListen(){
+  const t=listenTrack,s=Math.round(listenAcc);
+  if(s>=1)listenAcc=0;
+  if(!ME||!t||!t.url||s<1)return;
+  fetch(API+'/event',{method:'POST',headers:{'Content-Type':'application/json'},keepalive:true,
+    body:JSON.stringify({kind:'listen',secs:s,pct:0,url:t.url,title:t.title,artist:t.artist||''})}).catch(()=>{});
+}
+setInterval(flushListen,60000);
+window.addEventListener('pagehide',flushListen);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)flushListen()});
+
 const favs=()=>lib.filter(t=>t.favorite);
 const getList=n=>n==='fav'?favs():searchRes;
 const key=t=>t.filename||t.vid||t.url||t.sid;
@@ -1309,18 +2886,14 @@ const artBg=t=>{const h=hue(t.title);return `linear-gradient(135deg,hsl(${h} 55%
 const tintOf=t=>`hsl(${hue(t.title)} 45% 30%)`;
 const LIKED_BG='linear-gradient(135deg,#450af5,#c4efd9)';
 const art=(t,cls)=>`<div class="${cls}" style="background:${artBg(t)}">${t.thumbnail?`<img src="${esc(t.thumbnail)}" alt="">`:ic.note}</div>`;
-/* playlist artwork: custom cover if the user uploaded one, otherwise generated gradient */
 const plBg=p=>p.cover?`url('${esc(p.cover)}') center/cover no-repeat`:artBg({title:p.name});
 const plIn=p=>p.cover?'':ic.note;
 function fmtDur(x){const n=parseInt(x);if(!n)return '';return Math.floor(n/60)+':'+String(n%60).padStart(2,'0')}
 function fmtTime(s){if(!s||isNaN(s))return '0:00';return Math.floor(s/60)+':'+String(Math.floor(s%60)).padStart(2,'0')}
 function fmtDate(d){if(!d)return '';const x=new Date(String(d).replace(' ','T'));return isNaN(x)?d:x.toLocaleDateString('en',{month:'short',day:'numeric',year:'numeric'})}
 function tint(c){$('main').style.setProperty('--tint',c)}
-let tt;function toast(m,type){const t=$('toast');t.textContent=m;t.className='toast show '+(type||'');clearTimeout(tt);tt=setTimeout(()=>t.classList.remove('show'),3000)}
+let tt;function toast(m,type){const t=$('toast');t.textContent=m;t.className='toast show '+(type||'');clearTimeout(tt);tt=setTimeout(()=>t.classList.remove('show'),4500)}
 
-/* FIX: /api/library and /api/playlists require a logged-in user. Guests used to call them on
-   every page load, which produced the 401 responses. Only call them when signed in. If the
-   server still answers 401 (cookie expired / account gone), treat it as "signed out". */
 function sessionLost(){
   if(!ME)return;
   ME=null;applyMe();lib=[];PL=[];
@@ -1360,27 +2933,138 @@ function renderSidebar(){
     $('sideList').innerHTML=h;
     return;
   }
-  const items=favs().filter(t=>!q||t.title.toLowerCase().includes(q));
   let h=`<div class="li${view==='liked'?' playing':''}" onclick="switchView('liked')"><div class="lart" style="background:${LIKED_BG}">${ic.heartOn}</div><div><div class="li-t">Liked Songs</div><div class="li-s">Playlist • ${favs().length} songs</div></div></div>`;
-  h+=items.map(t=>{
-    const sidTxt=t.sid?` • #${esc(t.sid)}`:'';
-    return `<div class="li${key(t)===now?' playing':''}" data-key="${esc(key(t))}" onclick="playFrom('fav',${favs().indexOf(t)})">${art(t,'lart')}<div style="min-width:0"><div class="li-t">${esc(t.title)}</div><div class="li-s">Song${sidTxt} • ${esc(t.artist||'Unknown Artist')}</div></div></div>`;
-  }).join('');
-  if(!items.length&&!q)h+=`<div class="empty" style="padding:32px 16px"><p>${ME?'No liked songs yet':'Log in to see your liked songs'}</p></div>`;
   $('sideList').innerHTML=h;
 }
 
-function setNav(){$('homeBtn').classList.toggle('active',view==='home');document.body.classList.toggle('v-search',view==='search');document.querySelectorAll('.tabbar button').forEach(b=>b.classList.toggle('on',b.dataset.tab===view))}
-function render(){({home:renderHome,search:renderSearch,liked:()=>renderPlaylist('fav'),playlist:()=>renderPlaylistView(currentPid)})[view]?.()}
+function setNav(){
+  $('homeBtn').classList.toggle('active',view==='home');
+  document.body.classList.toggle('v-search',view==='search');
+  const tv=view==='profile'?'leaderboard':((view==='playlists'||view==='liked'||view==='playlist')?'library':view);
+  document.querySelectorAll('.tabbar button').forEach(b=>b.classList.toggle('on',b.dataset.tab===tv));
+}
+function render(){
+  ({
+    home:renderHome,
+    search:renderSearch,
+    liked:()=>renderPlaylist('fav'),
+    playlists:renderPlaylists,
+    playlist:()=>renderPlaylistView(currentPid),
+    leaderboard:renderLeaderboard,
+    profile:()=>renderProfile(currentProfileId)
+  })[view]?.();
+}
 function switchView(v,force){
-  if(v==='library')v='liked';
+  if(v==='library')v='playlists';
   view=v;setNav();if(v!=='search')$('searchInput').value='';
   if(v==='search'&&force){lastQuery='';searchRes=[]}
-  render();$('main').scrollTop=0;renderSidebar()
+  render();$('main').scrollTop=0;renderSidebar();
 }
 
 function card(t,i,ln){return `<div class="card" onclick="playFrom('${ln}',${i})">${art(t,'cart')}<button class="fab" onclick="event.stopPropagation();playFrom('${ln}',${i})">${ic.play}</button><div class="card-t">${esc(t.title)}</div><div class="card-s">${esc(t.artist||'Song')}</div></div>`}
 function shelf(title,list,ln,more){return list.length?`<div class="sh"><h2>${title}</h2>${more?`<a onclick="switchView('${more}')">Show all</a>`:''}</div><div class="cards">${list.slice(0,8).map((t,i)=>card(t,i,ln)).join('')}</div>`:''}
+
+/* ---------- dashboard / leaderboard / profile ---------- */
+let DASH={top:[]};
+let lbPeriod='all',currentProfileId=null;
+function fmtHrs(s){s=Math.round(s||0);const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}h ${m}m`:m?`${m}m`:`${s}s`}
+function avatarHTML(name,size){
+  const h=hue(name);
+  return `<div class="lbav" style="width:${size}px;height:${size}px;font-size:${Math.round(size*.38)}px;background:linear-gradient(135deg,hsl(${h} 55% 40%),hsl(${(h+45)%360} 60% 22%))">${esc(initials(name))}</div>`;
+}
+function dashBody(d){
+  const mx=Math.max(1,...d.days.map(x=>x.secs));
+  const bars=d.days.map(x=>`<div class="dbar" title="${esc(x.date)}: ${fmtHrs(x.secs)}"><em>${x.secs?fmtHrs(x.secs):'&nbsp;'}</em><div class="dcol"><i style="height:${Math.max(2,x.secs/mx*100)}%"></i></div>${esc(x.label)}</div>`).join('');
+  const top=d.top.length?d.top.map((t,i)=>`<div class="dtop" onclick="playDash(${i})"><span class="dn">${i+1}</span>${art(t,'rthumb')}<div class="rtx"><div class="rtitle">${esc(t.title)}</div><div class="rsub">${t.plays} play${t.plays===1?'':'s'}${t.secs?' • '+fmtHrs(t.secs):''}</div></div></div>`).join('')
+    :`<div style="color:var(--sub);padding:12px 0">No plays yet — stats will show up here once songs are played.</div>`;
+  return `<div class="dash">
+      <div class="dstat"><small>Total listening time</small><b>${fmtHrs(d.total_secs)}</b></div>
+      <div class="dstat"><small>Today</small><b>${fmtHrs(d.today_secs)}</b></div>
+      <div class="dstat"><small>Last 7 days</small><b>${fmtHrs(d.week_secs)}</b></div>
+      <div class="dstat"><small>Songs played</small><b>${d.total_plays}</b><small style="margin:4px 0 0">${d.unique_tracks} unique</small></div>
+    </div>
+    <div class="dgrid">
+      <div class="dpanel"><h3>Last 7 days</h3><div class="dbars">${bars}</div></div>
+      <div class="dpanel"><h3>Most played</h3>${top}</div>
+    </div>`;
+}
+async function loadDash(){
+  if(!ME||!$('dash'))return;
+  try{
+    const r=await fetch(API+'/dashboard');
+    if(!r.ok)return;
+    const d=await r.json();DASH=d;
+    const box=$('dash');if(!box)return;
+    box.innerHTML=`<div class="sh" style="margin-top:8px"><h2>Your dashboard</h2><a onclick="openProfile(${ME.id})">My profile</a></div>`+dashBody(d);
+  }catch(e){console.error(e)}
+}
+function playDash(i){
+  const l=(DASH.top||[]).map(t=>({url:t.url,title:t.title,thumbnail:t.thumbnail,artist:t.artist}));
+  if(!l.length)return;
+  queue=l;qi=i;load();
+}
+function lbRow(r){
+  return `<div class="lbrow${r.is_me?' me':''}" onclick="openProfile(${r.id})">
+    <span class="lbrank r${r.rank}">${r.rank}</span>${avatarHTML(r.name,40)}
+    <div class="rtx"><div class="rtitle">${esc(r.name)}${r.is_me?'<span class="lbyou">You</span>':''}</div><div class="rsub">${r.top_track?'Most played: '+esc(r.top_track):r.plays+' plays'}</div></div>
+    <div class="lbstat"><b>${fmtHrs(r.secs)}</b><small>${r.plays} play${r.plays===1?'':'s'}</small></div>
+  </div>`;
+}
+async function loadHomeBoard(){
+  if(!ME||!$('hboard'))return;
+  try{
+    const r=await fetch(API+'/leaderboard?period=week');
+    if(!r.ok)return;
+    const d=await r.json();
+    const box=$('hboard');
+    if(!box||!d.rows||!d.rows.length)return;
+    box.innerHTML=`<div class="sh"><h2>Top listeners this week</h2><a onclick="switchView('leaderboard')">Show all</a></div><div class="dpanel">${d.rows.slice(0,5).map(lbRow).join('')}</div>`;
+  }catch(e){}
+}
+function setLbPeriod(p){lbPeriod=p;renderLeaderboard()}
+async function renderLeaderboard(){
+  tint('#1e3264');
+  if(!ME){
+    $('c').innerHTML=`<div class="empty"><div class="em">${ic.trophy}</div><h3>Leaderboard</h3><p>Log in to see who listens the most.<br><button class="covbtn" style="margin-top:12px" onclick="openAuth('login')">Log in</button></p></div>`;
+    return;
+  }
+  $('c').innerHTML=loadingHTML('Loading leaderboard…');
+  try{
+    const r=await fetch(API+'/leaderboard?period='+lbPeriod);
+    if(r.status===401){sessionLost();return switchView('home')}
+    const d=await r.json();
+    if(view!=='leaderboard')return;
+    const chips=`<div class="chiprow"><button class="chip${lbPeriod==='all'?' on':''}" onclick="setLbPeriod('all')">All time</button><button class="chip${lbPeriod==='week'?' on':''}" onclick="setLbPeriod('week')">This week</button></div>`;
+    let h=`<h1 class="greet">Leaderboard</h1>${chips}`;
+    if(d.me&&!d.me.public)h+=`<div class="lbnote">Your stats are hidden from other listeners. Turn it back on from your account menu to appear here.</div>`;
+    else if(d.me&&d.me.rank)h+=`<div class="lbnote">You are <b style="color:#fff">#${d.me.rank}</b> ${lbPeriod==='week'?'this week':'of all time'} with <b style="color:#fff">${fmtHrs(d.me.secs)}</b> of listening.</div>`;
+    h+=d.rows.length?`<div class="dpanel">${d.rows.map(lbRow).join('')}</div>`
+      :`<div class="empty"><div class="em">${ic.trophy}</div><h3>No listeners yet</h3><p>Play some songs to be the first on the board.</p></div>`;
+    $('c').innerHTML=h;
+  }catch(e){toast('Failed: '+e.message,'error')}
+}
+function openProfile(id){
+  if(needLogin('Sign up to see listener profiles.'))return;
+  currentProfileId=id;view='profile';setNav();render();$('main').scrollTop=0;renderSidebar();
+}
+async function renderProfile(uid){
+  tint('#3a2b4a');
+  $('c').innerHTML=loadingHTML('Loading profile…');
+  try{
+    const r=await fetch(`${API}/profile/${uid}`);
+    const d=await r.json();
+    if(view!=='profile'||currentProfileId!==uid)return;
+    if(!r.ok){
+      $('c').innerHTML=`<div class="empty"><div class="em">${ic.trophy}</div><h3>${esc(d.error||'Profile unavailable')}</h3><p><button class="covbtn" onclick="switchView('leaderboard')">Back to leaderboard</button></p></div>`;
+      return;
+    }
+    DASH=d;
+    $('c').innerHTML=`<div class="plh">${avatarHTML(d.name,180)}
+      <div style="min-width:0"><small>Profile</small><h1>${esc(d.name)}</h1>
+      <p>${d.rank?'Rank #'+d.rank+' of '+d.total_users+' • ':''}${d.joined?'Joined '+esc(fmtDate(d.joined)):''}${!d.public?' • Hidden from others':''}</p></div></div>
+      <div class="plact"><button class="covbtn" onclick="switchView('leaderboard')">${ic.trophy} Leaderboard</button></div>`+dashBody(d);
+  }catch(e){toast('Failed: '+e.message,'error')}
+}
 
 async function renderHome(){
   await loadLib();await loadPlaylists();if(view!=='home')return;
@@ -1391,17 +3075,19 @@ async function renderHome(){
     tiles.push(`<div class="tile" onmouseenter="tint('#3a2b4a')" onclick="renderPlaylistView(${p.id})"><div class="tart" style="background:${plBg(p)}">${plIn(p)}</div><span>${esc(p.name)}</span><button class="fab" onclick="event.stopPropagation();playPlaylist(${p.id})">${ic.play}</button></div>`);
   });
   const first=ME&&ME.name?String(ME.name).split(' ')[0]:'';
-  let html=`<div class="chiprow"><button class="chip on">All</button><button class="chip" onclick="switchView('liked')">Liked</button><button class="chip" onclick="setChip('playlists');switchView('liked')">Playlists</button></div>
+  let html=`<div class="chiprow"><button class="chip on">All</button><button class="chip" onclick="setChip('liked');switchView('liked')">Liked</button><button class="chip" onclick="setChip('playlists');switchView('playlists')">Playlists</button><button class="chip" onclick="switchView('leaderboard')">Leaderboard</button></div>
   <h1 class="greet">${g}${first?', '+esc(first):''}</h1>`;
   if(!ME)html+=`<div class="guestban"><div><b>You're listening as a guest</b><span>Guests hear the first half of each song. Sign up free for full songs, likes and playlists.</span></div><button onclick="openAuth('signup')">Sign up</button></div>`;
+  if(ME)html+=`<div id="dash"></div><div id="hboard"></div>`;
   html+=`<div class="tiles">${tiles.join('')}</div>`;
   html+=shelf('Your favorites',favs(),'fav','liked');
   if(PL.length){
-     html+=`<div class="sh"><h2>Your Playlists</h2><a onclick="setChip('playlists');switchView('liked')">Show all</a></div>`;
+     html+=`<div class="sh"><h2>Your Playlists</h2><a onclick="setChip('playlists');switchView('playlists')">Show all</a></div>`;
      html+=`<div class="cards">`+PL.slice(0,8).map(p=>`<div class="card" onclick="renderPlaylistView(${p.id})"><div class="cart" style="background:${plBg(p)}">${plIn(p)}</div><div class="card-t">${esc(p.name)}</div><div class="card-s">Playlist • ${p.n} songs</div></div>`).join('')+`</div>`;
   }
   if(!lib.length&&!PL.length)html+=`<div class="empty"><div class="em">${ic.note}</div><h3>${ME?'Your library is empty':'Search for a song to start listening'}</h3><p>${ME?'Search for a song and like it to build your collection.':'Use the search bar above to find any song.'}</p></div>`;
   $('c').innerHTML=html;renderSidebar();
+  loadDash();loadHomeBoard();
 }
 
 function row(t,i,ln,playFn='playFrom'){
@@ -1421,19 +3107,61 @@ async function renderPlaylist(ln){
   await loadLib();if(view!=='liked')return;
   const list=favs();
   tint('#4b3aa8');
-  let h=`<div class="plh"><div class="plart" style="background:${LIKED_BG}">${ic.heartOn}</div>
+  let h=`<div class="chiprow">
+    <button class="chip on">Liked</button>
+    <button class="chip" onclick="setChip('playlists');switchView('playlists')">Playlists</button>
+  </div>
+  <div class="plh"><div class="plart" style="background:${LIKED_BG}">${ic.heartOn}</div>
    <div style="min-width:0"><small>Playlist</small><h1>Liked Songs</h1><p><b>${esc(ME?ME.name:'')}</b> • ${list.length} song${list.length===1?'':'s'}</p></div></div>
    <div class="plact"><button class="fab" onclick="playList('fav')">${ic.play}</button><button class="ib ${shuffleOn?'on':''}" onclick="toggleShuffle();render()">${ic.shuffle}</button></div>`;
   if(!ME)h+=`<div class="empty"><div class="em">${ic.heart}</div><h3>Log in to see your liked songs</h3><p><button class="covbtn" style="margin-top:8px" onclick="openAuth('login')">Log in</button></p></div>`;
   else if(!list.length)h+=`<div class="empty"><div class="em">${ic.heart}</div><h3>Songs you like will appear here</h3><p>Tap the heart on any song to save it.</p></div>`;
   else h+=`<div class="rowh"><div>#</div><div>Title</div><div>Date added</div><div class="r">${ic.clock}</div></div>`+list.map((t,i)=>row(t,i,ln)).join('');
-  $('c').innerHTML=h;renderSidebar();
+  $('c').innerHTML=h;setChip('liked');renderSidebar();
+}
+
+async function renderPlaylists(){
+  await loadPlaylists();if(view!=='playlists')return;
+  tint('#1e3264');
+  let h=`<div class="chiprow">
+    <button class="chip" onclick="setChip('liked');switchView('liked')">Liked</button>
+    <button class="chip on">Playlists</button>
+  </div>
+  <div class="sh" style="margin-top:0;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+    <div>
+      <h1 class="greet" style="margin:0 0 4px 0">Playlists</h1>
+      <p style="color:var(--sub);margin:0">${PL.length} playlist${PL.length===1?'':'s'} in your library</p>
+    </div>
+    <button class="covbtn" style="display:inline-flex;align-items:center;gap:8px;padding:10px 18px;font-size:14px;font-weight:700" onclick="openNewPlaylist()">${ic.plus} New playlist</button>
+  </div>`;
+
+  let cards = `<div class="card" onclick="openNewPlaylist()" style="cursor:pointer">
+    <div class="cart" style="background:linear-gradient(135deg,#1ed760,#0a6b2c);display:flex;align-items:center;justify-content:center;color:#000;font-size:28px">${ic.plus}</div>
+    <div class="card-t">New playlist</div>
+    <div class="card-s">Create a playlist</div>
+  </div>`;
+
+  if(PL.length){
+    cards += PL.map(p=>`<div class="card" onclick="renderPlaylistView(${p.id})">
+      <div class="cart" style="background:${plBg(p)}">${plIn(p)}</div>
+      <button class="fab" onclick="event.stopPropagation();playPlaylist(${p.id})">${ic.play}</button>
+      <div class="card-t">${esc(p.name)}</div>
+      <div class="card-s">Playlist • ${p.n} song${p.n===1?'':'s'}</div>
+    </div>`).join('');
+  }
+  h += `<div class="cards">${cards}</div>`;
+  if(!PL.length){
+    h += `<div class="empty" style="margin-top:20px"><div class="em">${ic.note}</div><h3>No playlists yet</h3><p>Tap "New playlist" above to create your first playlist.</p></div>`;
+  }
+  $('c').innerHTML=h;
+  setChip('playlists');
+  renderSidebar();
 }
 
 let currentPid=null;
 async function renderPlaylistView(pid){
   currentPid=pid;view='playlist';setNav();tint('#3a2b4a');
-  $('c').innerHTML=`<div class="empty"><div class="em">${ic.note}</div><h3>Loading playlist…</h3></div>`;
+  $('c').innerHTML=loadingHTML('Loading playlist…');
   try{
     const d=await fetch(`${API}/playlists/${pid}`).then(r=>r.json());
     if(d.error){toast(d.error,'error');return switchView('liked')}
@@ -1462,7 +3190,6 @@ async function renderPlaylistView(pid){
   }catch(e){toast('Failed: '+e.message,'error')}
 }
 
-/* ---------- custom playlist cover ---------- */
 let coverTarget=null;
 function changeCover(pid){
   if(needLogin('Sign up to customize playlists.'))return;
@@ -1482,7 +3209,7 @@ $('coverInput').addEventListener('change',async()=>{
         try{
           const N=600,c=document.createElement('canvas');c.width=c.height=N;
           const x=c.getContext('2d'),s=Math.min(im.width,im.height);
-          x.drawImage(im,(im.width-s)/2,(im.height-s)/2,s,s,0,0,N,N);   // centre-crop to a square
+          x.drawImage(im,(im.width-s)/2,(im.height-s)/2,s,s,0,0,N,N);
           URL.revokeObjectURL(url);
           res(c.toDataURL('image/jpeg',.86));
         }catch(e){rej(e)}
@@ -1539,24 +3266,36 @@ async function deletePlaylist(pid){
   try{
     await fetch(`${API}/playlists/${pid}`,{method:'DELETE'});
     toast('Playlist deleted');await loadPlaylists();
-    switchView('liked');renderSidebar();
+    switchView('playlists');renderSidebar();
   }catch(e){toast('Failed: '+e.message,'error')}
 }
 
 function openNewPlaylist(cb){
   if(needLogin('Sign up to create playlists.'))return;
-  const m=$('plModal'),i=$('plNameIn');
-  i.value='';m.classList.add('open');setTimeout(()=>i.focus(),50);
+  const m=$('plModal'),i=$('plNameIn'),err=$('plError');
+  i.value='';err.style.display='none';err.textContent='';
+  m.classList.add('open');setTimeout(()=>i.focus(),50);
   const go=async()=>{
     const v=i.value.trim();
-    if(!v)return i.focus();
+    if(!v){err.textContent='Please give your playlist a name.';err.style.display='block';i.focus();return}
+    const btn=$('plGo'),old=btn.textContent;
+    btn.disabled=true;btn.innerHTML=`<span class="btn-spin"></span>Creating…`;
     try{
       const d=await fetch(API+'/playlists',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:v})}).then(r=>r.json());
-      if(d.error)return toast(d.error,'error');
+      btn.disabled=false;btn.textContent=old;
+      if(d.error){
+        err.textContent=d.error;err.style.display='block';
+        err.classList.remove('shake');void err.offsetWidth;err.classList.add('shake');
+        toast(d.error,'error');return;
+      }
       m.classList.remove('open');toast('Playlist created');
       await loadPlaylists();
-      if(typeof cb==='function')cb(d.id,d.name);else renderSidebar();
-    }catch(e){toast('Failed: '+e.message,'error')}
+      if(typeof cb==='function')cb(d.id,d.name);else{renderSidebar();if(view==='playlists')renderPlaylists();}
+    }catch(e){
+      btn.disabled=false;btn.textContent=old;
+      err.textContent='Failed: '+e.message;err.style.display='block';
+      toast('Failed: '+e.message,'error');
+    }
   };
   $('plGo').onclick=go;
   i.onkeydown=e=>{if(e.key==='Enter')go()};
@@ -1568,7 +3307,8 @@ function openAddToPlaylist(t,e){
   if(e)e.stopPropagation();
   if(needLogin('Sign up to add songs to playlists.'))return;
   addTarget=t;
-  const m=$('addModal'),l=$('addList');
+  const m=$('addModal'),l=$('addList'),err=$('addError');
+  err.style.display='none';err.textContent='';
   if(!PL.length){
     l.innerHTML='<div style="text-align:center;padding:20px;color:var(--sub)">No playlists yet</div>';
   }else{
@@ -1583,15 +3323,29 @@ function openAddToPlaylist(t,e){
 }
 async function doAddToPlaylist(pid){
   const t=addTarget;if(!t)return;
+  const err=$('addError');
   try{
     const d=await fetch(`${API}/playlists/${pid}/add`,{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({url:t.url,title:t.title,thumbnail:t.thumbnail,artist:t.artist||'',duration:t.duration||''})}).then(r=>r.json());
-    if(d.error){$('addModal').classList.remove('open');return toast(d.error,'error')}
+    if(d.error){
+      err.textContent=d.error;err.style.display='block';
+      err.classList.remove('shake');void err.offsetWidth;err.classList.add('shake');
+      toast(d.error,'error');return;
+    }
     toast('Added to playlist');
     $('addModal').classList.remove('open');
     await loadPlaylists();
     if(view==='playlist'&&currentPid===pid)renderPlaylistView(pid);else renderSidebar();
-  }catch(e){toast('Failed: '+e.message,'error')}
+  }catch(e){
+    err.textContent='Failed: '+e.message;err.style.display='block';
+    toast('Failed: '+e.message,'error');
+  }
+}
+function addCurrentToPlaylist(e){
+  if(e)e.stopPropagation();
+  const t=curT();
+  if(!t)return toast('Nothing playing right now');
+  openAddToPlaylist(t,e);
 }
 
 const GENRES=[['Pop','#e8115b'],['Hip-Hop','#bc5900'],['OPM','#148a08'],['Rock','#e13300'],['Chill','#477d95'],['R&B','#7d4b32'],['Workout','#503750'],['Indie','#8d67ab'],['Party','#dc148c'],['Throwback','#1e3264']];
@@ -1603,7 +3357,7 @@ function renderSearch(){
 function runSearch(q){$('searchInput').value=q;doSearch(q)}
 async function doSearch(q){
   lastQuery=q;view='search';setNav();
-  $('c').innerHTML=`<div class="empty"><div class="em">${ic.search}</div><h3>Searching…</h3><p>Looking for "${esc(q)}"</p></div>`;
+  $('c').innerHTML=loadingHTML('Searching for "'+esc(q)+'"…');
   try{
     const d=await fetch(API+'/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})}).then(r=>r.json());
     if(d.error){toast(d.error,'error');searchRes=[];return renderSearch()}
@@ -1642,29 +3396,53 @@ function playFrom(ln,i){
 }
 function playList(ln){const l=getList(ln);if(!l.length)return toast(ln==='fav'?'Like a song first':'Nothing to play yet');queue=shuffleOn?shuffleArr(l):l.slice();qi=0;load()}
 function load(){
-  const t=curT();if(!t)return;now=key(t);
-  errCount=errCount; // (kept across auto-skips; reset on a successful 'playing' event)
+  const t=curT();if(!t)return;
+  flushListen();listenTrack=null;   // save time listened to the previous song
+  now=key(t);
+  errCount=errCount;
   audio.src=t.filename?`${API}/play/${encodeURIComponent(t.filename)}`:`${API}/stream?url=${encodeURIComponent(t.url)}`;
-  audio.play().catch(e=>{if(e&&e.name!=='AbortError')toast('Playback error: '+e.message,'error')});
+  
+  // Handle autoplay policy gracefully
+  const playPromise = audio.play();
+  if (playPromise !== undefined) {
+    playPromise.then(() => {
+      autoplayBlocked = false;
+    }).catch(e => {
+      if (e.name === 'NotAllowedError') {
+        autoplayBlocked = true;
+        setPP(false);
+        // Don't show a scary red error, the user just needs to click the play button.
+      } else if (e.name !== 'AbortError') {
+        toast('Playback error: ' + e.message, 'error');
+      }
+    });
+  }
+
   $('nTitle').textContent=t.title;$('nArtist').textContent=t.filename?(t.artist||'Unknown Artist'):'YouTube';
   $('nArt').style.background=artBg(t);$('nArt').innerHTML=t.thumbnail?`<img src="${esc(t.thumbnail)}" alt="">`:ic.note;
   document.title=t.title+' • SPOPUDAY';sendEv('play',0,t);syncHeart();markPlaying();applyTheme(t);renderQueue();topUp();syncMobile(t);
   persistState();
   if(!t.filename && autoplay && repeat===0){setTimeout(()=>topUp(true),400);}
-  if(lyricsOpen)loadLyrics();
+  if(lyricsOpen||document.querySelector('.body.with-lyrics')) loadLyrics();
 }
 function syncHeart(){
-  const t=curT(),b=$('nHeart'),fh=$('fpHeart');if(!t)return;
+  const t=curT();
+  const b=$('nHeart'),fh=$('fpHeart'),bp=$('nAddPl'),fp=$('fpAddPl');
+  if(!t){
+    [b,fh,bp,fp].forEach(x=>{if(x)x.style.visibility='hidden'});
+    return;
+  }
   const m=libMatch(t),fav=!!(m&&m.favorite);
-  [b,fh].forEach(x=>{x.style.visibility='visible';x.classList.toggle('on',fav);x.innerHTML=fav?ic.heartOn:ic.heart});
+  [b,fh].forEach(x=>{if(!x)return;x.style.visibility='visible';x.classList.toggle('on',fav);x.innerHTML=fav?ic.heartOn:ic.heart});
+  [bp,fp].forEach(x=>{if(x)x.style.visibility='visible'});
 }
 function markPlaying(){document.querySelectorAll('[data-key]').forEach(e=>e.classList.toggle('playing',e.dataset.key===now))}
 function togglePlay(){
   if(!audio.src)return;
   if(audio.paused){
-    // guest already hit the half-song limit on this track -> show sign-up instead of resuming
     if(!ME&&audio.duration&&audio.currentTime>=audio.duration/2-0.25){guestWall();return}
-    audio.play().catch(()=>{});
+    const p = audio.play();
+    if (p !== undefined) p.then(() => { autoplayBlocked = false; }).catch(()=>{});
   }else audio.pause();
 }
 async function next(auto){
@@ -1700,14 +3478,11 @@ const libMatch=t=>{
 const isSaved=t=>!!libMatch(t);
 function shuffleArr(a){a=a.slice();for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]]}return a}
 
-/* Autoplay: keeps the queue topped up with similar songs.
-   Fixes: (1) a stale in-flight request for an OLD queue no longer blocks the new one,
-          (2) if the first pass finds nothing it retries with a looser exclude list,
-          (3) the server now has a fallback search so it practically never returns empty. */
 function topUp(force){
   if(relP&&relQ===queue)return relP;
   if(!autoplay||repeat!==0||!queue.length)return Promise.resolve();
-  if(!force&&queue.length-1-qi>=4)return Promise.resolve();
+  // Increased buffer from 4 to 6 to ensure there's always a song ready
+  if(!force&&queue.length-1-qi>=6)return Promise.resolve();
   const q=queue;relQ=q;lastTopUp=Date.now();
   const p=(async()=>{
     try{
@@ -1737,8 +3512,8 @@ function topUp(force){
 }
 function maybePrefetch(){
   if(!autoplay||repeat!==0||!queue.length||!audio.duration)return;
-  if(qi<queue.length-1)return;                       // already something queued
-  if(audio.duration-audio.currentTime>40)return;     // only when the song is nearly over
+  // Increased early fetch window from 40s to 60s before the song ends
+  if(audio.duration-audio.currentTime>60)return;
   if(Date.now()-lastTopUp<8000)return;
   topUp(true);
 }
@@ -1788,65 +3563,147 @@ async function applyTheme(t){
   themeColor=c;tint(c);document.documentElement.style.setProperty('--theme',c);
 }
 
-let lyrics={lines:[],loading:false,url:null,lang:null,translated:{},targetLang:null,active:-1};
+/* ================================================================
+   LYRICS
+   ================================================================ */
+let lyrics={lines:[],loading:false,url:null,lang:null,translated:{},targetLang:null,active:-1,source:null,synced:null,credit:null};
 let lyricsOpen=false;
 const LYRIC_LANGS=[['Original',null],['English','en'],['Tagalog','tl'],['Español','es'],['日本語','ja'],['한국어','ko'],['中文','zh-CN']];
+
+function isDesktopLyricsOpen(){return document.querySelector('.body').classList.contains('with-lyrics')}
+
 function toggleLyrics(){
   lyricsOpen=!lyricsOpen;
   $('fpLyrics').classList.toggle('open',lyricsOpen);
   $('fpLyricsBtn').classList.toggle('on',lyricsOpen);
   if(lyricsOpen)loadLyrics();
 }
+
+function toggleLyricsDesktop(){
+  const body=document.querySelector('.body');
+  const btn=$('bDesktopLyrics');
+  const isOpen=body.classList.contains('with-lyrics');
+  if(isOpen){
+    body.classList.remove('with-lyrics');
+    btn&&btn.classList.remove('on');
+  }else{
+    body.classList.add('with-lyrics');
+    btn&&btn.classList.add('on');
+    loadLyrics();
+  }
+}
+
 async function loadLyrics(){
-  const t=curT();if(!t||!t.url)return;
+  const t=curT();
+  if(!t||!t.url){
+    lyrics={lines:[],loading:false,url:null,lang:null,translated:{},targetLang:null,active:-1,source:null,synced:null,credit:null};
+    renderLyricsAll();renderLangs();
+    return;
+  }
   const videoUrl=t.url;
-  if(lyrics.url===videoUrl&&(lyrics.lines.length||lyrics.loading))return renderLyrics();
-  lyrics={lines:[],loading:true,url:videoUrl,lang:null,translated:{},targetLang:null,active:-1};
+  if(lyrics.url===videoUrl&&(lyrics.lines.length||lyrics.loading))return renderLyricsAll();
+  lyrics={lines:[],loading:true,url:videoUrl,lang:null,translated:{},targetLang:null,active:-1,source:null,synced:null,credit:null};
   $('lyrTitle').textContent=t.title;
-  renderLyrics();renderLangs();
+  const sub=$('lyrSideSub');if(sub)sub.textContent=t.title;
+  renderLyricsAll();renderLangs();
   try{
-    const d=await fetch(`${API}/lyrics?url=${encodeURIComponent(videoUrl)}`).then(r=>r.json());
+    const params=new URLSearchParams({
+      url: videoUrl,
+      title: t.title || '',
+      artist: t.artist || '',
+      duration: String(durSecs(t) || '')
+    });
+    const d=await fetch(`${API}/lyrics?${params}`).then(r=>r.json());
     if(lyrics.url!==videoUrl)return;
     lyrics.loading=false;
     if(d.error||!d.lines||!d.lines.length)lyrics.lines=[];
     else{lyrics.lines=d.lines;lyrics.lang=d.lang;}
-    renderLyrics();renderLangs();updateLyricsHighlight();
-  }catch(e){lyrics.loading=false;lyrics.lines=[];renderLyrics()}
+    lyrics.source=d.source||null;
+    lyrics.synced=d.synced===undefined?null:d.synced;
+    lyrics.credit=d.credit||null;
+    renderLyricsAll();renderLangs();updateLyricsHighlight();
+  }catch(e){lyrics.loading=false;lyrics.lines=[];renderLyricsAll()}
 }
+
 function renderLangs(){
-  const box=$('lyrLangs');
-  if(!lyrics.lines.length){box.innerHTML='';return}
-  box.innerHTML=LYRIC_LANGS.map(([name,code])=>{
+  const html=!lyrics.lines.length?'':LYRIC_LANGS.map(([name,code])=>{
     const on=(code===null?!lyrics.targetLang:lyrics.targetLang===code)?' on':'';
     return `<button class="fp-lyr-lang${on}" onclick="setLyricsLang('${code||''}')">${name}</button>`;
   }).join('');
+  const mBox=$('lyrLangs');if(mBox)mBox.innerHTML=html;
+  const dBox=$('lyrSideLangs');if(dBox)dBox.innerHTML=html;
 }
+
 async function setLyricsLang(code){
   if(!lyrics.lines.length)return;
-  if(!code){lyrics.targetLang=null;renderLangs();renderLyrics();return}
+  if(!code){lyrics.targetLang=null;renderLangs();renderLyricsAll();return}
   if(needLogin('Sign up to translate lyrics.'))return;
   lyrics.targetLang=code;
-  if(lyrics.translated[code]){renderLangs();renderLyrics();return}
+  if(lyrics.translated[code]){renderLangs();renderLyricsAll();return}
   toast('Translating…');
   try{
     const d=await fetch(`${API}/translate`,{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({lines:lyrics.lines.map(l=>l.text),target:code})}).then(r=>r.json());
     if(d.error){toast('Translation failed: '+d.error,'error');lyrics.targetLang=null;renderLangs();return}
     lyrics.translated[code]=d.lines;
-    renderLangs();renderLyrics();
+    renderLangs();renderLyricsAll();
   }catch(e){toast('Translation failed: '+e.message,'error');lyrics.targetLang=null;renderLangs()}
 }
-function renderLyrics(){
-  const body=$('lyrBody');
-  if(lyrics.loading){body.innerHTML=`<div class="fp-lyr-loading">Looking for lyrics…</div>`;return}
-  if(!lyrics.lines.length){body.innerHTML=`<div class="fp-lyr-empty">No lyrics or captions found for this song.<br><br>They may not be available for this track.</div>`;return}
-  const text=(lyrics.targetLang&&lyrics.translated[lyrics.targetLang])?lyrics.translated[lyrics.targetLang]:lyrics.lines.map(l=>l.text);
-  body.innerHTML=lyrics.lines.map((l,i)=>`<div class="fp-lyr-line" data-li="${i}" onclick="seekToLyric(${i})">${esc(text[i]||'')}</div>`).join('');
+
+function approxNoteHTML(){
+  if(lyrics.synced === false && lyrics.lines.length){
+    return `<div class="fp-lyr-approx">Timing is approximate (unsynced lyrics)</div>`;
+  }
+  return '';
+}
+
+function renderLyricsAll(){
+  if(!curT()){
+    const empty=`<div class="fp-lyr-empty">Play a song to see its lyrics</div>`;
+    const mBody=$('lyrBody');if(mBody)mBody.innerHTML=empty;
+    const dBody=$('lyrSideBody');if(dBody)dBody.innerHTML=`<div class="lyr-side-empty">Play a song to see its lyrics</div>`;
+    return;
+  }
+  const mBody=$('lyrBody');
+  const dBody=$('lyrSideBody');
+
+  if(lyrics.loading){
+    if(mBody)mBody.innerHTML=`<div class="fp-lyr-loading">Looking for lyrics…</div>`;
+    if(dBody)dBody.innerHTML=`<div class="lyr-side-loading"><div class="loader"><div class="spinner"></div><div class="loader-text">Looking for lyrics…</div></div></div>`;
+    return;
+  }
+  if(!lyrics.lines.length){
+    if(mBody)mBody.innerHTML=`<div class="fp-lyr-empty">No lyrics found for this song.<br><br>Try a different version, or the track may not be in LRCLIB yet.</div>`;
+    if(dBody)dBody.innerHTML=`<div class="lyr-side-empty">No lyrics found for this song.<br><br>Try a different version, or the track may not be in LRCLIB yet.</div>`;
+    return;
+  }
+
+  const text=(lyrics.targetLang&&lyrics.translated[lyrics.targetLang])
+    ?lyrics.translated[lyrics.targetLang]
+    :lyrics.lines.map(l=>l.text);
+
+  const approx = approxNoteHTML();
+
+  if(mBody){
+    mBody.innerHTML = approx + lyrics.lines.map((l,i)=>
+      `<div class="fp-lyr-line" data-li="${i}" onclick="seekToLyric(${i})">${esc(text[i]||'')}</div>`
+    ).join('');
+  }
+  if(dBody){
+    dBody.innerHTML = approx + lyrics.lines.map((l,i)=>
+      `<div class="lyr-line" data-li="${i}" onclick="seekToLyric(${i})">${esc(text[i]||'')}</div>`
+    ).join('');
+  }
   updateLyricsHighlight();
 }
+
 function seekToLyric(i){if(!lyrics.lines[i])return;audio.currentTime=lyrics.lines[i].t}
+
 function updateLyricsHighlight(){
-  if(!lyricsOpen||!lyrics.lines.length)return;
+  if(!lyrics.lines.length)return;
+  const mobileOpen=$('fpLyrics').classList.contains('open');
+  const desktopOpen=isDesktopLyricsOpen();
+  if(!mobileOpen&&!desktopOpen)return;
   const t=audio.currentTime;
   let idx=-1;
   for(let i=0;i<lyrics.lines.length;i++){
@@ -1856,28 +3713,41 @@ function updateLyricsHighlight(){
   }
   if(idx===lyrics.active)return;
   lyrics.active=idx;
-  const body=$('lyrBody');
-  body.querySelectorAll('.fp-lyr-line').forEach((el,i)=>{
-    el.classList.toggle('active',i===idx);
-    el.classList.toggle('past',i<idx);
-  });
-  if(idx>=0){const el=body.querySelector(`[data-li="${idx}"]`);if(el)el.scrollIntoView({behavior:'smooth',block:'center'})}
+
+  const mBody=$('lyrBody');
+  if(mBody){
+    mBody.querySelectorAll('.fp-lyr-line').forEach((el,i)=>{
+      el.classList.toggle('active',i===idx);
+      el.classList.toggle('past',i<idx);
+    });
+  }
+  const dBody=$('lyrSideBody');
+  if(dBody){
+    dBody.querySelectorAll('.lyr-line').forEach((el,i)=>{
+      el.classList.toggle('active',i===idx);
+      el.classList.toggle('past',i<idx);
+    });
+  }
+  if(idx>=0){
+    const mEl=mBody&&mBody.querySelector(`[data-li="${idx}"]`);
+    if(mEl)try{mEl.scrollIntoView({behavior:'smooth',block:'center'})}catch(e){}
+    const dEl=dBody&&dBody.querySelector(`[data-li="${idx}"]`);
+    if(dEl)try{dEl.scrollIntoView({behavior:'smooth',block:'center'})}catch(e){}
+  }
 }
 
 audio.addEventListener('play',()=>{setPP(true);document.body.classList.remove('is-paused');$('fpDisc').classList.add('playing');$('mArt').classList.add('playing');persistState()});
-audio.addEventListener('pause',()=>{setPP(false);document.body.classList.add('is-paused');$('fpDisc').classList.remove('playing');$('mArt').classList.remove('playing');persistState()});
-audio.addEventListener('playing',()=>{errCount=0});
+audio.addEventListener('pause',()=>{flushListen();setPP(false);document.body.classList.add('is-paused');$('fpDisc').classList.remove('playing');$('mArt').classList.remove('playing');persistState()});
+audio.addEventListener('playing',()=>{errCount=0;autoplayBlocked=false;});
 audio.addEventListener('ended',()=>next(true));
-/* If a stream URL fails (expired / geo-blocked / extraction error) move on to the next song
-   instead of getting stuck. Gives up after 3 failures in a row. */
 audio.addEventListener('error',()=>{
   if(!audio.getAttribute('src'))return;
   toast('Could not play this track','error');
   if(autoplay&&queue.length&&errCount<3){errCount++;setTimeout(()=>next(true),900)}
 });
 ['timeupdate','loadedmetadata'].forEach(ev=>audio.addEventListener(ev,()=>{
+  tickListen();
   if(!audio.duration||seeking)return;
-  // guests only get the first half of every song
   if(!ME&&isFinite(audio.duration)&&audio.duration>1&&audio.currentTime>=audio.duration/2){guestWall();return}
   const pct=(audio.currentTime/audio.duration*100)+'%',cur=fmtTime(audio.currentTime),tot=fmtTime(audio.duration);
   document.querySelectorAll('[data-fill]').forEach(e=>e.style.width=pct);
@@ -1899,6 +3769,14 @@ slider($('prog'),(p,done)=>{if(!audio.duration)return;seeking=!done;$('prog').qu
 function setVolUI(){const v=audio.muted?0:audio.volume;$('vol').querySelector('.fill').style.width=v*100+'%';$('bMute').innerHTML=v===0?ic.mute:ic.vol}
 slider($('vol'),p=>{audio.volume=p;audio.muted=false;setVolUI()});
 audio.volume=.7;
+
+// Global interaction listener to resume audio if autoplay was blocked
+document.addEventListener('click', () => {
+  if (autoplayBlocked && audio.src) {
+    autoplayBlocked = false;
+    audio.play().catch(()=>{});
+  }
+});
 
 document.addEventListener('keydown',e=>{
   if(e.code==='Space'&&!/INPUT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();togglePlay()}
@@ -1990,22 +3868,26 @@ if('mediaSession' in navigator){
 }
 
 (async function init(){
-  setVolUI();document.body.classList.add('is-paused');
-  try{const me=await fetch(API+'/me').then(r=>r.json());if(me.user){ME=me.user;applyMe()}}catch(e){}
-  // Guests are allowed in now (they get half-song previews); no forced login wall.
-  // loadLib/loadPlaylists are no-ops for guests, so no more 401s on page load.
-  await loadLib();await loadPlaylists();
-  renderSidebar();renderHome();
+  try{
+    setVolUI();document.body.classList.add('is-paused');
+    try{const me=await fetch(API+'/me').then(r=>r.json());if(me.user){ME=me.user;applyMe()}}catch(e){}
+    await loadLib();await loadPlaylists();
+    renderSidebar();renderHome();
 
-  // restore queue/position from localStorage
-  const pos=restoreState();
-  if(queue.length&&qi>=0){
-    load();
-    audio.addEventListener('loadedmetadata',function once(){
-      audio.pause();
-      if(pos>0&&pos<(audio.duration||Infinity))audio.currentTime=pos;
-      audio.removeEventListener('loadedmetadata',once);
-    },{once:true});
+    const pos=restoreState();
+    if(queue.length&&qi>=0){
+      load();
+      audio.addEventListener('loadedmetadata',function once(){
+        audio.pause();
+        if(pos>0&&pos<(audio.duration||Infinity))audio.currentTime=pos;
+        audio.removeEventListener('loadedmetadata',once);
+      },{once:true});
+    }
+  }catch(err){
+    console.error('init error', err);
+  }finally{
+    const pl=$('pageLoad');
+    if(pl){pl.classList.add('hide');setTimeout(()=>{try{pl.remove()}catch(e){}},500)}
   }
 })();
 </script>
@@ -2046,16 +3928,15 @@ def load_session():
         if payload and isinstance(payload.get('uid'), int):
             uid = payload['uid']
         else:
-            g.stale_cookie = True          # bad signature / expired / secret changed
+            g.stale_cookie = True
     if uid is not None:
         u = xl_find_one('users', id=uid)
         if u:
-            g.user = {'id': u['id'], 'name': u['name'], 'email': u['email']}
+            g.user = {'id': u['id'], 'name': u['name'], 'email': u['email'],
+                      'show_stats': u.get('show_stats') != 0}
             g.sid = 'jwt:' + str(uid)
+            record_user_activity(u['id'], _client_ip(), g.dev)
         else:
-            # Valid signature but the user row is gone (workbook wiped / not shared between
-            # workers). Do NOT trust the token for data access — ids restart at 1 and could
-            # collide with a different account. Log it and drop the cookie.
             print(f'⚠️ JWT for uid={uid} is valid but no such user in the database '
                   f'(ephemeral disk or multiple workers?)')
             g.stale_cookie = True
@@ -2065,7 +3946,6 @@ def load_session():
 
 @app.after_request
 def drop_stale_cookie(resp):
-    # Clear a cookie that can never authenticate again, so the browser stops sending it.
     if getattr(g, 'stale_cookie', False) and request.path != '/api/logout':
         clear_jwt_cookie(resp)
     return resp
@@ -2082,9 +3962,1102 @@ def needs_user(fn):
 
 @app.route('/api/me')
 def me():
-    # 'session' tells the client why there is no user (helps debugging the 401s)
     state = 'ok' if g.user else ('expired' if g.stale_cookie else 'guest')
     return jsonify({'user': g.user, 'device_id': g.dev, 'session': state})
+
+
+def render_admin_page(client_ip):
+    safe_ip = html.escape(str(client_ip or 'unknown'))
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPOPUDAY • Admin Control Room</title>
+<style>
+  :root {{
+    --bg: #0b0b0e;
+    --card: #14141a;
+    --card-hover: #191922;
+    --border: rgba(255, 255, 255, 0.08);
+    --border-subtle: rgba(255, 255, 255, 0.04);
+    --green: #1ed760;
+    --green-dark: #169c46;
+    --red: #ef4444;
+    --yellow: #f59e0b;
+    --blue: #3b82f6;
+    --text: #ffffff;
+    --text-dim: #9ca3af;
+    --text-muted: #6b7280;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+    padding: 0;
+    margin: 0;
+    overflow-x: hidden;
+  }}
+  /* Header */
+  header {{
+    background: #111116;
+    border-bottom: 1px solid var(--border);
+    padding: 16px 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }}
+  .brand-group {{ display: flex; align-items: center; gap: 14px; }}
+  .brand-logo {{
+    width: 38px;
+    height: 38px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--green), #0a6b2c);
+    color: #000;
+    font-size: 20px;
+    font-weight: 900;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 4px 16px rgba(30, 215, 96, 0.35);
+  }}
+  .brand-text h1 {{ font-size: 17px; font-weight: 800; letter-spacing: 0.5px; line-height: 1.2; }}
+  .brand-text p {{ font-size: 11px; color: var(--text-dim); }}
+  .header-actions {{ display: flex; align-items: center; gap: 12px; }}
+  .badge {{
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+  }}
+  .badge-green {{ background: rgba(30, 215, 96, 0.12); color: var(--green); border: 1px solid rgba(30, 215, 96, 0.25); }}
+  .badge-red {{ background: rgba(239, 68, 68, 0.12); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.25); }}
+  .badge-gray {{ background: rgba(255, 255, 255, 0.06); color: var(--text-dim); border: 1px solid var(--border); }}
+  .btn {{
+    background: rgba(255, 255, 255, 0.08);
+    color: #fff;
+    border: 1px solid var(--border);
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }}
+  .btn:hover {{ background: rgba(255, 255, 255, 0.14); border-color: rgba(255, 255, 255, 0.2); }}
+  .btn-primary {{ background: var(--green); color: #000; font-weight: 700; border: none; }}
+  .btn-primary:hover {{ background: #1fdf64; transform: translateY(-1px); }}
+  .btn-danger {{ background: rgba(239, 68, 68, 0.15); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }}
+  .btn-danger:hover {{ background: var(--red); color: #fff; }}
+  .btn-sm {{ padding: 5px 10px; font-size: 11px; border-radius: 6px; }}
+
+  /* Main Container */
+  .container {{ max-width: 1200px; margin: 0 auto; padding: 28px 24px 60px; }}
+
+  /* Tabs Nav */
+  .tabs {{
+    display: flex;
+    gap: 8px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+    padding-bottom: 4px;
+  }}
+  .tab-btn {{
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    font-size: 14px;
+    font-weight: 600;
+    padding: 10px 18px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }}
+  .tab-btn:hover {{ color: #fff; background: rgba(255, 255, 255, 0.04); }}
+  .tab-btn.active {{ color: var(--green); background: rgba(30, 215, 96, 0.1); border-bottom: 2px solid var(--green); }}
+
+  /* Stats Grid */
+  .stats-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 28px;
+  }}
+  .stat-card {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    transition: transform 0.2s, border-color 0.2s;
+  }}
+  .stat-card:hover {{ transform: translateY(-2px); border-color: rgba(255, 255, 255, 0.15); }}
+  .stat-icon {{
+    width: 48px;
+    height: 48px;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 22px;
+  }}
+  .stat-info h3 {{ font-size: 24px; font-weight: 800; line-height: 1.1; margin-bottom: 4px; }}
+  .stat-info p {{ font-size: 12px; color: var(--text-dim); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; }}
+
+  /* Section Card */
+  .card {{
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 24px;
+    margin-bottom: 24px;
+  }}
+  .card-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-subtle);
+  }}
+  .card-header h2 {{ font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 8px; }}
+
+  /* Table */
+  .table-responsive {{ overflow-x: auto; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; text-align: left; }}
+  th {{
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+  }}
+  td {{
+    padding: 14px;
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text);
+    vertical-align: middle;
+  }}
+  tr:hover td {{ background: rgba(255, 255, 255, 0.02); }}
+  .user-cell {{ display: flex; align-items: center; gap: 12px; }}
+  .user-avatar {{
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: #252532;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    font-size: 12px;
+    color: var(--green);
+    position: relative;
+  }}
+  .status-dot {{
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    border: 2px solid var(--card);
+    position: absolute;
+    bottom: -1px;
+    right: -1px;
+  }}
+  .status-dot.online {{ background: var(--green); box-shadow: 0 0 8px var(--green); }}
+  .status-dot.offline {{ background: #6b7280; }}
+
+  .ip-tag {{
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    border-radius: 6px;
+    color: #e5e7eb;
+  }}
+
+  /* Forms */
+  .form-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 18px; }}
+  .form-group {{ display: flex; flex-direction: column; gap: 6px; }}
+  .form-group label {{ font-size: 12px; font-weight: 600; color: var(--text-dim); }}
+  .form-control {{
+    background: #0d0d12;
+    border: 1px solid var(--border);
+    color: #fff;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.2s;
+  }}
+  .form-control:focus {{ border-color: var(--green); }}
+  .form-check {{ display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }}
+  .form-check input {{ cursor: pointer; accent-color: var(--green); }}
+
+  /* Alerts */
+  .alert {{
+    padding: 12px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    margin-bottom: 16px;
+    display: none;
+  }}
+  .alert-success {{ background: rgba(30, 215, 96, 0.12); color: var(--green); border: 1px solid rgba(30, 215, 96, 0.3); }}
+  .alert-danger {{ background: rgba(239, 68, 68, 0.12); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }}
+
+  /* Profile Details Grid */
+  .profile-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
+  .profile-item {{
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 14px 18px;
+  }}
+  .profile-item .label {{ font-size: 11px; color: var(--text-muted); text-transform: uppercase; margin-bottom: 4px; }}
+  .profile-item .val {{ font-size: 14px; font-weight: 600; word-break: break-all; }}
+
+  /* IP Tag list */
+  .ip-list {{ display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }}
+  .ip-chip {{
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: #0d0d12;
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 8px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 12px;
+  }}
+  .ip-chip-del {{
+    background: none;
+    border: none;
+    color: var(--red);
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
+  }}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand-group">
+    <div class="brand-logo">♫</div>
+    <div class="brand-text">
+      <h1>SPOPUDAY CONTROL ROOM</h1>
+      <p>Administrator System • by Jhon Wilson</p>
+    </div>
+  </div>
+  <div class="header-actions">
+    <span class="badge badge-green">● Authorized: {safe_ip}</span>
+    <button class="btn btn-sm" onclick="loadAllData()">🔄 Refresh</button>
+    <a href="/" class="btn btn-primary btn-sm">🎧 Open App</a>
+  </div>
+</header>
+
+<div class="container">
+  <!-- Stats Bar -->
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-icon" style="background: rgba(30, 215, 96, 0.12); color: var(--green);">🟢</div>
+      <div class="stat-info">
+        <h3 id="statOnline">0</h3>
+        <p>Active Users (Online)</p>
+      </div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background: rgba(156, 163, 175, 0.12); color: var(--text-dim);">⚪</div>
+      <div class="stat-info">
+        <h3 id="statOffline">0</h3>
+        <p>Offline Users</p>
+      </div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background: rgba(59, 130, 246, 0.12); color: var(--blue);">👥</div>
+      <div class="stat-info">
+        <h3 id="statTotalUsers">0</h3>
+        <p>Total Accounts</p>
+      </div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background: rgba(239, 68, 68, 0.12); color: var(--red);">🛡️</div>
+      <div class="stat-info">
+        <h3 id="statBans">0</h3>
+        <p>Banned IPs</p>
+      </div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-icon" style="background: rgba(245, 158, 11, 0.12); color: var(--yellow);">🎵</div>
+      <div class="stat-info">
+        <h3 id="statSongs">0</h3>
+        <p>Library Tracks</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tabs Navigation -->
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('users')">👥 Users & Activity</button>
+    <button class="tab-btn" onclick="switchTab('add-account')">➕ Add Account</button>
+    <button class="tab-btn" onclick="switchTab('profile')">🌐 Website Profile</button>
+    <button class="tab-btn" onclick="switchTab('security')">🔒 IP Whitelist & Bans</button>
+  </div>
+
+  <!-- TAB 1: USERS & ACTIVITY -->
+  <div id="tab-users" class="tab-content">
+    <div class="card">
+      <div class="card-header">
+        <h2>👥 Registered Accounts & Active Sessions</h2>
+        <div style="display:flex; gap:10px;">
+          <input type="text" id="userFilter" class="form-control" placeholder="Search users or IPs..." style="width:240px;" oninput="renderUserTable()">
+        </div>
+      </div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>User</th>
+              <th>Email</th>
+              <th>Last IP Address</th>
+              <th>Last Active</th>
+              <th>Created</th>
+              <th>Verified</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="userTableBody">
+            <tr><td colspan="8" style="text-align:center; padding:24px; color:var(--text-dim);">Loading accounts...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 2: ADD ACCOUNT -->
+  <div id="tab-add-account" class="tab-content" style="display:none;">
+    <div class="card" style="max-width: 650px; margin: 0 auto;">
+      <div class="card-header">
+        <h2>➕ Create New User Account</h2>
+      </div>
+      <div id="createAlert" class="alert"></div>
+      <form id="createAccountForm" onsubmit="handleCreateAccount(event)">
+        <div class="form-grid">
+          <div class="form-group">
+            <label>Full Name / Display Name</label>
+            <input type="text" id="newUserName" class="form-control" placeholder="e.g. John Wilson" required>
+          </div>
+          <div class="form-group">
+            <label>Email Address</label>
+            <input type="email" id="newUserEmail" class="form-control" placeholder="user@spopuday.com" required>
+          </div>
+        </div>
+        <div class="form-group" style="margin-bottom:18px;">
+          <label>Password</label>
+          <input type="password" id="newUserPassword" class="form-control" placeholder="Minimum 8 characters" minlength="8" required>
+        </div>
+        <div class="form-group" style="margin-bottom:24px;">
+          <label class="form-check">
+            <input type="checkbox" id="newUserVerified" checked>
+            <span>Pre-verify account (allows user to log in immediately without email code)</span>
+          </label>
+        </div>
+        <button type="submit" class="btn btn-primary" style="width:100%;">Create Account</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- TAB 3: WEBSITE PROFILE -->
+  <div id="tab-profile" class="tab-content" style="display:none;">
+    <div class="card">
+      <div class="card-header">
+        <h2>🌐 Website & Server Profile</h2>
+      </div>
+      <div class="profile-grid">
+        <div class="profile-item">
+          <div class="label">Application Name</div>
+          <div class="val" style="color:var(--green);">SPOPUDAY (v2.0 Hardened)</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">Owner / Creator</div>
+          <div class="val">Jhon Wilson</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">Server Host & Port</div>
+          <div class="val" id="profServerIp">0.0.0.0:5000</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">Active Admin Client IP</div>
+          <div class="val ip-tag">{safe_ip}</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">Data Directory</div>
+          <div class="val" id="profDataDir" style="font-size:12px;">-</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">Database Engine</div>
+          <div class="val">Excel (.xlsx) + SQLite (WAL)</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">Security Protection</div>
+          <div class="val" style="color:var(--green);">Active (Honeypot, 404 Shield, IP Gate)</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">IP Gatekeeper File</div>
+          <div class="val">ip.txt (1 IP per line)</div>
+        </div>
+        <div class="profile-item">
+          <div class="label">YouTube Cookies (yt-dlp)</div>
+          <div class="val" id="profYtCookies" style="font-size:12px;">Checking...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TAB 4: SECURITY & IP WHITELIST -->
+  <div id="tab-security" class="tab-content" style="display:none;">
+    <!-- Allowed Admin IPs -->
+    <div class="card">
+      <div class="card-header">
+        <h2>🔒 Allowed Admin IPs (ip.txt)</h2>
+        <span class="badge badge-green">1 IP per line</span>
+      </div>
+      <p style="font-size:13px; color:var(--text-dim); margin-bottom:16px;">
+        Only clients whose IP address appears below can access this control room. Other IPs receive a custom 403 Forbidden page.
+      </p>
+      <div id="ipAlert" class="alert"></div>
+      <form onsubmit="handleAddAllowedIp(event)" style="display:flex; gap:10px; margin-bottom:16px; max-width:480px;">
+        <input type="text" id="newAllowedIp" class="form-control" placeholder="e.g. 192.168.1.100" required style="flex:1;">
+        <button type="submit" class="btn btn-primary">➕ Add IP</button>
+      </form>
+      <div class="ip-list" id="allowedIpsList">
+        <span style="color:var(--text-dim);">Loading allowed IPs...</span>
+      </div>
+    </div>
+
+    <!-- Active Bans -->
+    <div class="card">
+      <div class="card-header">
+        <h2>🛡️ Active IP Bans & DDoS Blocks</h2>
+        <span class="badge badge-red" id="activeBansCountBadge">0 Active</span>
+      </div>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Banned IP</th>
+              <th>Reason</th>
+              <th>Strikes</th>
+              <th>Expires In</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="bansTableBody">
+            <tr><td colspan="5" style="text-align:center; padding:18px; color:var(--text-dim);">No active bans.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let USERS = [];
+let OVERVIEW = {{}};
+let BANS = [];
+
+function switchTab(name) {{
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+  const target = document.getElementById('tab-' + name);
+  if (target) target.style.display = 'block';
+  event.target.classList.add('active');
+}}
+
+async function loadAllData() {{
+  try {{
+    const [ovRes, uRes, bRes] = await Promise.all([
+      fetch('/api/admin/overview').then(r => r.json()),
+      fetch('/api/admin/users').then(r => r.json()),
+      fetch('/api/admin/bans').then(r => r.json())
+    ]);
+
+    if (ovRes.ok) {{
+      OVERVIEW = ovRes;
+      document.getElementById('statOnline').textContent = ovRes.stats.online_users || 0;
+      document.getElementById('statOffline').textContent = ovRes.stats.offline_users || 0;
+      document.getElementById('statTotalUsers').textContent = ovRes.stats.total_users || 0;
+      document.getElementById('statBans').textContent = ovRes.stats.active_bans || 0;
+      document.getElementById('statSongs').textContent = ovRes.stats.total_songs || 0;
+
+      document.getElementById('profServerIp').textContent = ovRes.profile.server_ip || '0.0.0.0:5000';
+      document.getElementById('profDataDir').textContent = ovRes.profile.data_dir || '-';
+
+      var cElem = document.getElementById('profYtCookies');
+      if (cElem) {{
+        if (ovRes.profile.yt_cookies && ovRes.profile.yt_cookies !== 'none') {{
+          cElem.textContent = '🟢 Connected (' + (ovRes.profile.yt_cookies_name || 'cookies.txt') + ')';
+          cElem.style.color = 'var(--green)';
+        }} else {{
+          cElem.textContent = '⚪ Not Connected';
+          cElem.style.color = '#888';
+        }}
+      }}
+
+      renderAllowedIps(ovRes.allowed_ips || []);
+    }}
+
+    if (uRes.ok && uRes.users) {{
+      USERS = uRes.users;
+      renderUserTable();
+    }}
+
+    if (bRes.bans) {{
+      BANS = bRes.bans;
+      renderBansTable();
+    }}
+  }} catch (e) {{
+    console.error('Failed to load admin data:', e);
+  }}
+}}
+
+function renderUserTable() {{
+  const query = (document.getElementById('userFilter').value || '').toLowerCase().trim();
+  const tbody = document.getElementById('userTableBody');
+  const filtered = USERS.filter(u => {{
+    if (!query) return true;
+    return (u.name || '').toLowerCase().includes(query) ||
+           (u.email || '').toLowerCase().includes(query) ||
+           (u.ip || '').toLowerCase().includes(query);
+  }});
+
+  if (!filtered.length) {{
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center; padding:24px; color:var(--text-dim);">No users found.</td></tr>';
+    return;
+  }}
+
+  tbody.innerHTML = filtered.map(u => {{
+    const isOnline = u.status === 'online';
+    const initial = (u.name || u.email || '?').charAt(0).toUpperCase();
+    return `
+      <tr>
+        <td>
+          <span class="badge ${{isOnline ? 'badge-green' : 'badge-gray'}}">
+            ${{isOnline ? '🟢 Online' : '⚪ Offline'}}
+          </span>
+        </td>
+        <td>
+          <div class="user-cell">
+            <div class="user-avatar">
+              ${{initial}}
+              <div class="status-dot ${{isOnline ? 'online' : 'offline'}}"></div>
+            </div>
+            <div>
+              <div style="font-weight:700;">${{escapeHtml(u.name || 'Unnamed')}}</div>
+              <div style="font-size:11px; color:var(--text-muted);">ID: #${{u.id}}</div>
+            </div>
+          </div>
+        </td>
+        <td>${{escapeHtml(u.email)}}</td>
+        <td>
+          ${{u.ip && u.ip !== 'N/A' ? `<span class="ip-tag">${{escapeHtml(u.ip)}}</span>` : '<span style="color:var(--text-muted)">Unknown</span>'}}
+        </td>
+        <td style="color:var(--text-dim); font-size:12px;">${{escapeHtml(u.last_seen_text || 'Never')}}</td>
+        <td style="color:var(--text-dim); font-size:12px;">${{escapeHtml(u.created || '-')}}</td>
+        <td>
+          <button class="btn btn-sm ${{u.verified ? 'badge-green' : 'badge-gray'}}" onclick="toggleVerifyUser(${{u.id}})">
+            ${{u.verified ? '✓ Verified' : 'Unverified'}}
+          </button>
+        </td>
+        <td>
+          <div style="display:flex; gap:6px;">
+            <button class="btn btn-sm btn-danger" onclick="deleteUser(${{u.id}}, '${{escapeHtml(u.name || u.email)}}')">🗑️ Delete</button>
+            ${{u.ip && u.ip !== 'N/A' && u.ip !== '127.0.0.1' ? `<button class="btn btn-sm btn-danger" onclick="banUserIp('${{escapeHtml(u.ip)}}')">🚫 Ban IP</button>` : ''}}
+          </div>
+        </td>
+      </tr>
+    `;
+  }}).join('');
+}}
+
+function renderAllowedIps(ips) {{
+  const list = document.getElementById('allowedIpsList');
+  if (!ips || !ips.length) {{
+    list.innerHTML = '<span style="color:var(--text-dim);">No IPs listed.</span>';
+    return;
+  }}
+  list.innerHTML = ips.map(ip => `
+    <div class="ip-chip">
+      <span>${{escapeHtml(ip)}}</span>
+      ${{ip !== '127.0.0.1' && ip !== '::1' ? `<button class="ip-chip-del" onclick="handleRemoveAllowedIp('${{escapeHtml(ip)}}')" title="Remove IP">&times;</button>` : ''}}
+    </div>
+  `).join('');
+}}
+
+function renderBansTable() {{
+  const tbody = document.getElementById('bansTableBody');
+  document.getElementById('activeBansCountBadge').textContent = `${{BANS.length}} Active`;
+  if (!BANS.length) {{
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; padding:18px; color:var(--text-dim);">No active bans. Server clean!</td></tr>';
+    return;
+  }}
+  tbody.innerHTML = BANS.map(b => `
+    <tr>
+      <td><span class="ip-tag" style="color:var(--red); border-color:rgba(239,68,68,0.3);">${{escapeHtml(b.ip)}}</span></td>
+      <td>${{escapeHtml(b.reason || 'Manual ban')}}</td>
+      <td>${{b.strikes || 1}}</td>
+      <td>${{Math.round(b.seconds_remaining || 0)}}s</td>
+      <td>
+        <button class="btn btn-sm btn-primary" onclick="unbanIp('${{escapeHtml(b.ip)}}')">Unban</button>
+      </td>
+    </tr>
+  `).join('');
+}}
+
+async function handleCreateAccount(e) {{
+  e.preventDefault();
+  const alertBox = document.getElementById('createAlert');
+  alertBox.style.display = 'none';
+
+  const name = document.getElementById('newUserName').value.trim();
+  const email = document.getElementById('newUserEmail').value.trim();
+  const password = document.getElementById('newUserPassword').value;
+  const verified = document.getElementById('newUserVerified').checked;
+
+  try {{
+    const res = await fetch('/api/admin/users/create', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ name, email, password, verified }})
+    }}).then(r => r.json());
+
+    if (res.ok) {{
+      alertBox.className = 'alert alert-success';
+      alertBox.textContent = `Account created successfully for ${{email}}!`;
+      alertBox.style.display = 'block';
+      document.getElementById('createAccountForm').reset();
+      document.getElementById('newUserVerified').checked = true;
+      loadAllData();
+    }} else {{
+      alertBox.className = 'alert alert-danger';
+      alertBox.textContent = res.error || 'Failed to create account';
+      alertBox.style.display = 'block';
+    }}
+  }} catch (err) {{
+    alertBox.className = 'alert alert-danger';
+    alertBox.textContent = 'Server connection error';
+    alertBox.style.display = 'block';
+  }}
+}}
+
+async function deleteUser(uid, name) {{
+  if (!confirm(`Are you sure you want to delete user "${{name}}" (ID: ${{uid}})?`)) return;
+  try {{
+    const res = await fetch(`/api/admin/users/${{uid}}`, {{ method: 'DELETE' }}).then(r => r.json());
+    if (res.ok) {{
+      loadAllData();
+    }} else {{
+      alert(res.error || 'Failed to delete user');
+    }}
+  }} catch (err) {{
+    alert('Error connecting to server');
+  }}
+}}
+
+async function toggleVerifyUser(uid) {{
+  try {{
+    const res = await fetch(`/api/admin/users/${{uid}}/toggle-verify`, {{ method: 'POST' }}).then(r => r.json());
+    if (res.ok) loadAllData();
+  }} catch (err) {{
+    alert('Error connecting to server');
+  }}
+}}
+
+async function handleAddAllowedIp(e) {{
+  e.preventDefault();
+  const input = document.getElementById('newAllowedIp');
+  const ip = input.value.trim();
+  if (!ip) return;
+  const alertBox = document.getElementById('ipAlert');
+  alertBox.style.display = 'none';
+  try {{
+    const res = await fetch('/api/admin/allowed-ips/add', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ ip }})
+    }}).then(r => r.json());
+    if (res.ok) {{
+      input.value = '';
+      loadAllData();
+    }} else {{
+      alertBox.className = 'alert alert-danger';
+      alertBox.textContent = res.error || 'Failed to add IP';
+      alertBox.style.display = 'block';
+    }}
+  }} catch (err) {{
+    alertBox.className = 'alert alert-danger';
+    alertBox.textContent = 'Network error';
+    alertBox.style.display = 'block';
+  }}
+}}
+
+async function handleRemoveAllowedIp(ip) {{
+  if (!confirm(`Remove ${{ip}} from ip.txt? Clients from this IP will lose admin panel access.`)) return;
+  try {{
+    const res = await fetch('/api/admin/allowed-ips/remove', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ ip }})
+    }}).then(r => r.json());
+    if (res.ok) loadAllData();
+  }} catch (err) {{
+    alert('Network error');
+  }}
+}}
+
+async function unbanIp(ip) {{
+  try {{
+    const res = await fetch(`/api/admin/unban/${{encodeURIComponent(ip)}}`, {{ method: 'POST' }}).then(r => r.json());
+    if (res.ok) loadAllData();
+  }} catch (err) {{
+    alert('Failed to unban IP');
+  }}
+}}
+
+async function banUserIp(ip) {{
+  if (!confirm(`Are you sure you want to ban IP ${{ip}} for 1 hour?`)) return;
+  try {{
+    const res = await fetch('/api/admin/ban', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ ip, reason: 'admin_manual_ban', duration: 3600 }})
+    }}).then(r => r.json());
+    if (res.ok) loadAllData();
+  }} catch (err) {{
+    alert('Failed to ban IP');
+  }}
+}}
+
+function escapeHtml(str) {{
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}}
+
+// Initialize and auto-refresh every 15s
+loadAllData();
+setInterval(loadAllData, 15000);
+</script>
+</body>
+</html>"""
+
+
+
+# =====================================================================
+#  ADMIN PANEL & CONTROL ROOM ROUTES (ip.txt IP-Restricted)
+# =====================================================================
+@app.route('/admin')
+@app.route('/admin-panel')
+def admin_panel_page():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return Response(render_403_page(client_ip), status=403, mimetype='text/html')
+    return Response(render_admin_page(client_ip), mimetype='text/html')
+
+
+@app.route('/api/admin/overview')
+def admin_overview():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    now = time.time()
+    all_users = xl_all('users')
+    with _USER_ACTIVITY_LOCK:
+        online_count = sum(1 for u in all_users if (now - _USER_ACTIVITY.get(str(u.get('id')), {}).get('last_seen', 0)) < 300)
+    total_users = len(all_users)
+    offline_count = max(0, total_users - online_count)
+    total_songs = len(xl_all('downloads'))
+    total_playlists = len(xl_all('playlists'))
+    with _BAN_LOCK:
+        active_bans = len([ip for ip, (until, _) in _BANNED.items() if until > now])
+
+    server_ip = "0.0.0.0:5000"
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        server_ip = f"{s.getsockname()[0]}:5000"
+        s.close()
+    except Exception:
+        pass
+
+    return jsonify({
+        'ok': True,
+        'profile': {
+            'name': 'SPOPUDAY',
+            'owner': 'Jhon Wilson',
+            'version': '2.0 Hardened',
+            'server_ip': server_ip,
+            'client_ip': client_ip,
+            'data_dir': DATA_DIR,
+            'xlsx_path': XLSX_PATH,
+            'ban_db_path': BAN_DB_PATH,
+            'yt_cookies': get_yt_cookies_path() or 'none',
+            'yt_cookies_name': os.path.basename(get_yt_cookies_path()) if get_yt_cookies_path() else ''
+        },
+        'stats': {
+            'total_users': total_users,
+            'online_users': online_count,
+            'offline_users': offline_count,
+            'total_songs': total_songs,
+            'total_playlists': total_playlists,
+            'active_bans': active_bans
+        },
+        'allowed_ips': sorted(list(get_allowed_admin_ips()))
+    })
+
+
+@app.route('/api/admin/users')
+def admin_users_list():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    now = time.time()
+    all_users = xl_all('users')
+    res = []
+    for u in all_users:
+        uid = u.get('id')
+        s_uid = str(uid)
+        with _USER_ACTIVITY_LOCK:
+            act = _USER_ACTIVITY.get(s_uid, {})
+        last_seen = act.get('last_seen')
+        is_online = bool(last_seen and (now - last_seen) < 300)
+        ip = act.get('ip') or 'N/A'
+
+        last_seen_text = 'Never'
+        if last_seen:
+            diff = int(now - last_seen)
+            if diff < 60:
+                last_seen_text = 'Active now'
+            elif diff < 3600:
+                last_seen_text = f'{diff // 60}m ago'
+            elif diff < 86400:
+                last_seen_text = f'{diff // 3600}h ago'
+            else:
+                last_seen_text = datetime.fromtimestamp(last_seen).strftime('%Y-%m-%d %H:%M')
+
+        res.append({
+            'id': uid,
+            'name': u.get('name') or 'Unnamed',
+            'email': u.get('email') or '',
+            'created': u.get('created') or '',
+            'verified': bool(u.get('verified')),
+            'status': 'online' if is_online else 'offline',
+            'ip': ip,
+            'last_seen': last_seen,
+            'last_seen_text': last_seen_text
+        })
+    return jsonify({'ok': True, 'users': res})
+
+
+@app.route('/api/admin/users/create', methods=['POST'])
+def admin_create_user():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    d = request.get_json(silent=True) or {}
+    name = re.sub(r'[\x00-<>]', '', str(d.get('name') or '')).strip()[:40]
+    email = _norm_email(d.get('email'))
+    pw = str(d.get('password') or '')
+    verified = 1 if d.get('verified', True) else 0
+
+    if not name:
+        return jsonify({'error': 'Name is required'}), 400
+    if not EMAIL_RE.match(email):
+        return jsonify({'error': 'Valid email is required'}), 400
+    if len(pw) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters'}), 400
+
+    row = xl_find_one('users', email=email)
+    if row:
+        return jsonify({'error': f'Email {email} is already registered'}), 409
+
+    new_id = xl_insert('users', name=name, email=email, password_hash=hash_pw(pw),
+                       verified=verified, created=now_s(), show_stats=1)
+    record_user_activity(new_id, client_ip)
+    return jsonify({'ok': True, 'user': {'id': new_id, 'name': name, 'email': email, 'verified': verified}})
+
+
+@app.route('/api/admin/users/<int:uid>', methods=['DELETE'])
+def admin_delete_user(uid):
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    xl_delete('users', id=uid)
+    xl_delete('sessions', user_id=uid)
+    with _USER_ACTIVITY_LOCK:
+        _USER_ACTIVITY.pop(str(uid), None)
+    return jsonify({'ok': True, 'deleted': uid})
+
+
+@app.route('/api/admin/users/<int:uid>/toggle-verify', methods=['POST'])
+def admin_toggle_verify_user(uid):
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    u = xl_find_one('users', id=uid)
+    if not u:
+        return jsonify({'error': 'user not found'}), 404
+    new_v = 0 if u.get('verified') else 1
+    xl_update('users', 'id', uid, verified=new_v)
+    return jsonify({'ok': True, 'id': uid, 'verified': new_v})
+
+
+@app.route('/api/admin/allowed-ips', methods=['GET'])
+def admin_get_allowed_ips():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    return jsonify({'ok': True, 'allowed_ips': sorted(list(get_allowed_admin_ips()))})
+
+
+@app.route('/api/admin/allowed-ips/add', methods=['POST'])
+def admin_add_allowed_ip():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    d = request.get_json(silent=True) or {}
+    new_ip = str(d.get('ip') or '').strip()
+    if not new_ip:
+        return jsonify({'error': 'IP address is required'}), 400
+    allowed = get_allowed_admin_ips()
+    if new_ip in allowed:
+        return jsonify({'ok': True, 'message': 'IP already allowed', 'allowed_ips': sorted(list(allowed))})
+
+    allowed.add(new_ip)
+    try:
+        with open(IP_TXT_PATH, 'w', encoding='utf-8') as f:
+            f.write("# SPOPUDAY Admin Allowed IPs (1 IP per line)\n")
+            for ip_val in sorted(allowed):
+                f.write(f"{ip_val}\n")
+    except Exception as e:
+        return jsonify({'error': f'Failed to write ip.txt: {e}'}), 500
+    return jsonify({'ok': True, 'added': new_ip, 'allowed_ips': sorted(list(allowed))})
+
+
+@app.route('/api/admin/allowed-ips/remove', methods=['POST'])
+def admin_remove_allowed_ip():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    d = request.get_json(silent=True) or {}
+    rem_ip = str(d.get('ip') or '').strip()
+    if rem_ip in ('127.0.0.1', '::1', 'localhost'):
+        return jsonify({'error': 'Cannot remove localhost'}), 400
+    allowed = get_allowed_admin_ips()
+    allowed.discard(rem_ip)
+    try:
+        with open(IP_TXT_PATH, 'w', encoding='utf-8') as f:
+            f.write("# SPOPUDAY Admin Allowed IPs (1 IP per line)\n")
+            for ip_val in sorted(allowed):
+                f.write(f"{ip_val}\n")
+    except Exception as e:
+        return jsonify({'error': f'Failed to write ip.txt: {e}'}), 500
+    return jsonify({'ok': True, 'removed': rem_ip, 'allowed_ips': sorted(list(allowed))})
+
+
+@app.route('/api/admin/ban', methods=['POST'])
+def admin_manual_ban():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    d = request.get_json(silent=True) or {}
+    target_ip = str(d.get('ip') or '').strip()
+    reason = str(d.get('reason') or 'admin_manual_ban').strip()
+    dur = int(d.get('duration') or 3600)
+    perm = bool(d.get('permanent', False))
+    if not target_ip:
+        return jsonify({'error': 'Target IP required'}), 400
+    if target_ip in ('127.0.0.1', '::1', 'localhost'):
+        return jsonify({'error': 'Cannot ban localhost'}), 400
+    _ban_ip(target_ip, reason, force_permanent=perm)
+    return jsonify({'ok': True, 'banned': target_ip, 'reason': reason})
+
+
+@app.route('/api/admin/bans')
+def admin_bans():
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        secret = os.environ.get('SPOPUDAY_ADMIN_SECRET', '')
+        if not secret or request.headers.get('X-Admin-Secret') != secret:
+            return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    try:
+        with _BAN_LOCK:
+            cur = _BAN_DB.execute(
+                'SELECT ip, banned_until, strikes, reason, created_at '
+                'FROM ip_bans WHERE banned_until > ? ORDER BY banned_until DESC',
+                (time.time(),)
+            )
+            rows = [{
+                'ip': ip, 'banned_until': until, 'strikes': strikes,
+                'reason': reason, 'created_at': created,
+                'seconds_remaining': max(0, int(until - time.time()))
+            } for ip, until, strikes, reason, created in cur.fetchall()]
+        return jsonify({'bans': rows, 'count': len(rows)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/admin/unban/<path:ip>', methods=['POST'])
+def admin_unban(ip):
+    client_ip = _client_ip()
+    if not is_admin_ip(client_ip):
+        secret = os.environ.get('SPOPUDAY_ADMIN_SECRET', '')
+        if not secret or request.headers.get('X-Admin-Secret') != secret:
+            return jsonify({'error': 'forbidden', 'ip': client_ip}), 403
+    try:
+        with _BAN_LOCK:
+            _BANNED.pop(ip, None)
+            _BAN_DB.execute('DELETE FROM ip_bans WHERE ip = ?', (ip,))
+            _BAN_DB.commit()
+        return jsonify({'ok': True, 'unbanned': ip})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.errorhandler(403)
+def error_403(e):
+    client_ip = _client_ip()
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Forbidden', 'reason': 'Access denied', 'ip': client_ip}), 403
+    return Response(render_403_page(client_ip), status=403, mimetype='text/html')
+
+
+@app.errorhandler(404)
+def error_404(e):
+    if request.path.startswith('/api/'):
+        return jsonify({'error': 'Not Found', 'path': request.path}), 404
+    return Response(render_404_page(request.path), status=404, mimetype='text/html')
 
 
 @app.route('/api/signup', methods=['POST'])
@@ -2107,7 +5080,7 @@ def signup():
         xl_update('users', 'id', row['id'], name=name, password_hash=hash_pw(pw))
     else:
         xl_insert('users', name=name, email=email, password_hash=hash_pw(pw),
-                  verified=0, created=now_s())
+                  verified=0, created=now_s(), show_stats=1)
     code = new_code()
     xl_delete_fn('email_codes', lambda r: r.get('email') == email and r.get('purpose') == 'signup' and not r.get('used'))
     xl_insert('email_codes', email=email, code_hash=code_hash(code), purpose='signup',
@@ -2196,7 +5169,8 @@ def verify_code():
         return jsonify({'error': 'Account not found'}), 404
     xl_update('email_codes', 'id', row['id'], used=1)
     xl_update('users', 'id', u['id'], verified=1)
-    resp = jsonify({'user': {'id': u['id'], 'name': u['name'], 'email': u['email']}})
+    resp = jsonify({'user': {'id': u['id'], 'name': u['name'], 'email': u['email'],
+                             'show_stats': u.get('show_stats') != 0}})
     return set_jwt_cookie(resp, u['id'])
 
 
@@ -2251,10 +5225,20 @@ def forgot_verify():
     if not u:
         return jsonify({'error': 'Account not found'}), 404
     xl_update('email_codes', 'id', row['id'], used=1)
-    # proving ownership of the email also verifies the account
     xl_update('users', 'id', u['id'], password_hash=hash_pw(new_pw), verified=1)
-    resp = jsonify({'ok': True, 'user': {'id': u['id'], 'name': u['name'], 'email': u['email']}})
+    resp = jsonify({'ok': True, 'user': {'id': u['id'], 'name': u['name'], 'email': u['email'],
+                                         'show_stats': u.get('show_stats') != 0}})
     return set_jwt_cookie(resp, u['id'])
+
+
+@app.route('/api/privacy', methods=['POST'])
+@needs_user
+def api_privacy():
+    d = request.get_json(silent=True) or {}
+    show = bool(d.get('show'))
+    xl_update('users', 'id', g.user['id'], show_stats=1 if show else 0)
+    _LB_CACHE.clear()
+    return jsonify({'ok': True, 'show_stats': show})
 
 
 @app.route('/api/save', methods=['POST'])
@@ -2442,7 +5426,6 @@ def play_media(filename):
         return jsonify({'error': str(e)}), 500
 
 
-# ---------------- playlists (+ custom cover images) ----------------
 COVER_NAME_RE = re.compile(r'^p\d+_[0-9a-f]{16}\.(jpg|png|webp)$')
 MAX_COVER_BYTES = 3 * 1024 * 1024
 
@@ -2531,7 +5514,6 @@ def api_set_playlist_cover(pid):
         return jsonify({'error': 'Invalid image data'}), 400
     if len(raw) > MAX_COVER_BYTES:
         return jsonify({'error': 'Image is too large (max 3 MB after resize)'}), 413
-    # verify the bytes really are an image of the claimed type (don't trust the header)
     if raw[:3] == b'\xff\xd8\xff':
         ext = 'jpg'
     elif raw[:8] == b'\x89PNG\r\n\x1a\n':
@@ -2577,7 +5559,7 @@ def api_playlist_cover(fname):
         return jsonify({'error': 'Not found'}), 404
     mime = {'jpg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp'}[fname.rsplit('.', 1)[1]]
     resp = send_file(fp, mimetype=mime)
-    resp.headers['Cache-Control'] = 'private, max-age=86400'   # filename is random per upload
+    resp.headers['Cache-Control'] = 'private, max-age=86400'
     return resp
 
 
@@ -2702,9 +5684,7 @@ def stream():
             return jsonify({'error': 'Could not extract stream URL'}), 502
         return redirect(stream_url)
     except (DownloadError, ExtractorError) as e:
-        # Extraction failed upstream (bot check, geo-block, removed video, throttling...).
-        # Report it as a bad-gateway, not as a crash of this server.
-        msg = re.sub(r'\x1b\[[0-9;]*m', '', str(e))[:300]       # strip ANSI colour codes
+        msg = re.sub(r'\x1b\[[0-9;]*m', '', str(e))[:300]
         print(f'❌ stream extraction failed: {msg}')
         return jsonify({'error': 'YouTube refused to provide this stream (bot check, region block or rate limit).',
                         'detail': msg}), 502
@@ -2781,87 +5761,51 @@ def manifest():
     })
 
 
-def _pick_captions(info):
-    subs = info.get('subtitles') or {}
-    autos = info.get('automatic_captions') or {}
-    def try_langs(d, langs):
-        for lang in langs:
-            for k in d.keys():
-                kl = k.lower()
-                if kl == lang.lower() or kl.startswith(lang.lower() + '-') or kl.startswith(lang.lower() + '_'):
-                    return k, d[k]
-        return None, None
-    prefs = ['en', 'en-us', 'en-gb', 'tl', 'fil', 'en-orig']
-    k, v = try_langs(subs, prefs)
-    if k: return k, v, True
-    k, v = try_langs(autos, prefs)
-    if k: return k, v, False
-    if subs: return list(subs.keys())[0], list(subs.values())[0], True
-    if autos: return list(autos.keys())[0], list(autos.values())[0], False
-    return None, None, False
-
-def _json3_url(formats):
-    for fmt in formats or []:
-        if fmt.get('ext') == 'json3':
-            return fmt.get('url')
-    if formats:
-        return formats[0].get('url')
-    return None
-
-
 @app.route('/api/lyrics')
 def api_lyrics():
-    url = (request.args.get('url') or '').strip()
-    if not url:
-        return jsonify({'error': 'Empty URL', 'lines': [], 'lang': None})
+    url    = (request.args.get('url') or '').strip()
+    title  = (request.args.get('title') or '').strip()
+    artist = (request.args.get('artist') or '').strip()
     try:
-        opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True,
-                'socket_timeout': 25, 'skip_download': True}
-        with YDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False) or {}
-        lang, formats, manual = _pick_captions(info)
-        if not formats:
-            return jsonify({'error': 'No captions available', 'lines': [], 'lang': None})
-        jurl = _json3_url(formats)
-        if not jurl:
-            return jsonify({'error': 'No caption URL', 'lines': [], 'lang': None})
-        req = urllib.request.Request(jurl, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode('utf-8', 'replace'))
-        events = data.get('events') or []
-        lines = []
-        for ev in events:
-            segs = ev.get('segs') or []
-            text = ''.join(s.get('utf8', '') for s in segs)
-            text = re.sub(r'\s+', ' ', text).strip()
-            if not text: continue
-            if text in ('[Music]', '[Applause]', '[Laughter]', '♪', '–'):
-                if len(text) < 4: continue
-            t0 = ev.get('tStartMs', 0) / 1000.0
-            d = ev.get('dDurationMs', 2000) / 1000.0
-            lines.append({'t': round(t0, 2), 'd': round(d, 2), 'text': text})
-        merged = []
-        for ln in lines:
-            if merged and (ln['t'] - (merged[-1]['t'] + merged[-1]['d'])) < 1.0 and len(merged[-1]['text']) < 90:
-                merged[-1]['text'] += ' ' + ln['text']
-                merged[-1]['d'] = round(ln['t'] + ln['d'] - merged[-1]['t'], 2)
-            else:
-                merged.append(dict(ln))
-        clean = []
-        for ln in merged:
-            if clean and clean[-1]['text'].strip() == ln['text'].strip():
-                clean[-1]['d'] = round(max(clean[-1]['d'], ln['d']), 2)
-            else:
-                clean.append(ln)
-        if not clean:
-            return jsonify({'error': 'No caption lines', 'lines': [], 'lang': lang})
-        return jsonify({'lines': clean, 'lang': lang, 'source': 'manual' if manual else 'auto'})
-    except (DownloadError, ExtractorError) as e:
-        print(f'❌ lyrics extraction failed: {e}')
-        return jsonify({'error': 'Captions unavailable right now', 'lines': [], 'lang': None}), 502
-    except Exception as e:
-        traceback.print_exc()
-        return jsonify({'error': str(e), 'lines': [], 'lang': None})
+        duration = int(float(request.args.get('duration') or 0))
+    except (TypeError, ValueError):
+        duration = 0
+
+    ck = _lyrics_cache_key(title, artist, duration) if (title or url) else None
+    if ck:
+        cached = _lyrics_cache_get(ck)
+        if cached is not None:
+            return jsonify({**cached, 'cached': True})
+
+    result = None
+
+    if title:
+        try:
+            result = _try_lrclib_for(title, artist, duration)
+        except Exception as e:
+            print(f'⚠️ LRCLIB lookup failed: {e}')
+            result = None
+        if result:
+            print(f'🎵 LRCLIB hit: {title[:40]} — {artist[:30]} ({duration}s)')
+
+    if not result and LYRICS_YT_FALLBACK and url:
+        try:
+            print(f'🎬 YouTube caption fallback for {title[:40]}')
+            result = _fetch_youtube_captions(url)
+        except Exception as e:
+            print(f'⚠️ YouTube captions fallback failed: {e}')
+            result = None
+
+    if result:
+        if ck:
+            _lyrics_cache_set(ck, result)
+        return jsonify(result)
+
+    empty = {'lines': [], 'lang': None, 'source': 'none',
+             'error': 'No lyrics found for this track'}
+    if ck:
+        _lyrics_cache_set(ck, empty)
+    return jsonify(empty)
 
 
 @app.route('/api/translate', methods=['POST'])
@@ -2911,7 +5855,10 @@ def api_translate():
         return jsonify({'error': str(e), 'lines': []})
 
 
-EVENT_KINDS = {'play', 'complete', 'skip', 'replay', 'like', 'unlike', 'save'}
+# =====================================================================
+#  EVENTS (play / skip / like ... and real listening time)
+# =====================================================================
+EVENT_KINDS = {'play', 'complete', 'skip', 'replay', 'like', 'unlike', 'save', 'listen'}
 
 
 @app.route('/api/event', methods=['POST'])
@@ -2927,18 +5874,178 @@ def event():
         pct = max(0.0, min(1.0, float(d.get('pct') or 0)))
     except (TypeError, ValueError):
         pct = 0.0
+    try:
+        secs = max(0.0, min(7200.0, float(d.get('secs') or 0)))
+    except (TypeError, ValueError):
+        secs = 0.0
+    if kind == 'listen' and secs < 1:
+        return jsonify({'ok': False}), 400
     uid = g.user['id']
-    existing = xl_find_fn('events', lambda r: r.get('user_id') == uid and r.get('sid') == g.sid and r.get('vid') == vid_ and r.get('kind') in ('play', 'complete', 'replay'))
-    if kind == 'play' and existing:
-        kind = 'replay'
+    if kind == 'play':
+        existing = xl_find_fn('events', lambda r: r.get('user_id') == uid and r.get('sid') == g.sid
+                              and r.get('vid') == vid_ and r.get('kind') in ('play', 'complete', 'replay'))
+        if existing:
+            kind = 'replay'
     xl_insert('events', user_id=uid, sid=g.sid, device_id=g.dev, vid=vid_,
               title=str(d.get('title') or '')[:200], artist=str(d.get('artist') or '')[:100],
               kind=kind, pct=pct, ts=time.time(), auto=1 if d.get('auto') else 0,
-              score=float(d.get('score') or 0))
-    # Background metadata fetch costs an extra YouTube request, so it only runs if enabled.
+              score=float(d.get('score') or 0), secs=secs)
     if META_FETCH and kind in ('complete', 'replay', 'like', 'save'):
         threading.Thread(target=get_meta, args=(vid_, True), daemon=True).start()
     return jsonify({'ok': True, 'kind': kind})
+
+
+# =====================================================================
+#  STATS: dashboard, leaderboard, public profiles
+# =====================================================================
+def _compute_stats(rows):
+    """Build the stats payload from a list of event rows (all belonging to one user)."""
+    plays, secs, info = Counter(), Counter(), {}
+    day_secs = defaultdict(float)
+    total = 0.0
+    for r in rows:
+        v, k = r.get('vid'), r.get('kind')
+        if not v:
+            continue
+        if r.get('title'):
+            info[v] = (r.get('title'), r.get('artist') or '')
+        if k == 'listen':
+            s = float(r.get('secs') or 0)
+            total += s
+            secs[v] += s
+            try:
+                day_secs[datetime.fromtimestamp(float(r.get('ts') or 0)).strftime('%Y-%m-%d')] += s
+            except Exception:
+                pass
+        elif k in ('play', 'replay'):
+            plays[v] += 1
+
+    today = datetime.now().date()
+    days = []
+    for i in range(6, -1, -1):
+        dt = today - timedelta(days=i)
+        key_ = dt.strftime('%Y-%m-%d')
+        days.append({'date': key_, 'label': dt.strftime('%a'), 'secs': round(day_secs.get(key_, 0))})
+
+    ids = set(plays) | set(secs)
+    ranked = sorted(ids, key=lambda v: (plays[v], secs[v]), reverse=True)[:10]
+    top = []
+    for v in ranked:
+        t, a = info.get(v, ('Unknown', ''))
+        top.append({'id': v, 'title': t, 'artist': a, 'plays': plays[v], 'secs': round(secs[v]),
+                    'url': f'https://www.youtube.com/watch?v={v}',
+                    'thumbnail': f'https://i.ytimg.com/vi/{v}/mqdefault.jpg'})
+    return {
+        'total_secs': round(total),
+        'today_secs': days[-1]['secs'],
+        'week_secs': sum(x['secs'] for x in days),
+        'total_plays': sum(plays.values()),
+        'unique_tracks': len(ids),
+        'days': days,
+        'top': top,
+    }
+
+
+_LB_CACHE = {}
+
+
+def _leaderboard_rows(period='all'):
+    """All users with activity, sorted by listening time. Cached for 20s."""
+    c = _LB_CACHE.get(period)
+    if c and time.time() - c[0] < 20:
+        return c[1]
+    cutoff = time.time() - 7 * 86400 if period == 'week' else 0.0
+    users = {u['id']: u for u in xl_all('users') if u.get('verified')}
+    agg = {}
+    for r in xl_all('events'):
+        uid = r.get('user_id')
+        if uid not in users:
+            continue
+        try:
+            ts = float(r.get('ts') or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts < cutoff:
+            continue
+        v, k = r.get('vid'), r.get('kind')
+        if not v:
+            continue
+        a = agg.get(uid)
+        if a is None:
+            a = agg[uid] = {'secs': 0.0, 'plays': 0, 'vids': set(), 'tp': Counter(), 'titles': {}}
+        if k == 'listen':
+            a['secs'] += float(r.get('secs') or 0)
+            a['vids'].add(v)
+        elif k in ('play', 'replay'):
+            a['plays'] += 1
+            a['vids'].add(v)
+            a['tp'][v] += 1
+        if r.get('title'):
+            a['titles'][v] = r['title']
+    rows = []
+    for uid, a in agg.items():
+        if a['secs'] <= 0 and a['plays'] <= 0:
+            continue
+        u = users[uid]
+        top = a['tp'].most_common(1)
+        rows.append({
+            'id': uid, 'name': u.get('name') or 'Listener',
+            'secs': round(a['secs']), 'plays': a['plays'], 'unique': len(a['vids']),
+            'top_track': a['titles'].get(top[0][0], '') if top else '',
+            'public': u.get('show_stats') != 0,
+        })
+    rows.sort(key=lambda x: (x['secs'], x['plays']), reverse=True)
+    _LB_CACHE[period] = (time.time(), rows)
+    return rows
+
+
+@app.route('/api/dashboard')
+@needs_user
+def api_dashboard():
+    uid = g.user['id']
+    rows = xl_find_fn('events', lambda r: r.get('user_id') == uid)
+    return jsonify(_compute_stats(rows))
+
+
+@app.route('/api/leaderboard')
+@needs_user
+def api_leaderboard():
+    period = 'week' if request.args.get('period') == 'week' else 'all'
+    me_id = g.user['id']
+    rows = _leaderboard_rows(period)
+    visible = [r for r in rows if r['public']]
+    out = []
+    for i, r in enumerate(visible):
+        out.append({**{k: r[k] for k in ('id', 'name', 'secs', 'plays', 'unique', 'top_track')},
+                    'rank': i + 1, 'is_me': r['id'] == me_id})
+    me_row = next((r for r in rows if r['id'] == me_id), None)
+    me = None
+    if me_row:
+        rank = next((x['rank'] for x in out if x['id'] == me_id), None)
+        me = {'id': me_id, 'secs': me_row['secs'], 'plays': me_row['plays'],
+              'rank': rank, 'public': me_row['public']}
+    elif g.user.get('show_stats') is False:
+        me = {'id': me_id, 'secs': 0, 'plays': 0, 'rank': None, 'public': False}
+    return jsonify({'period': period, 'rows': out[:50], 'me': me, 'total': len(out)})
+
+
+@app.route('/api/profile/<int:uid>')
+@needs_user
+def api_profile(uid):
+    u = xl_find_one('users', id=uid)
+    if not u or not u.get('verified'):
+        return jsonify({'error': 'Listener not found'}), 404
+    is_me = uid == g.user['id']
+    public = u.get('show_stats') != 0
+    if not public and not is_me:
+        return jsonify({'error': 'This listener keeps their stats private'}), 403
+    rows = xl_find_fn('events', lambda r: r.get('user_id') == uid)
+    stats = _compute_stats(rows)
+    lb = [r for r in _leaderboard_rows('all') if r['public']]
+    rank = next((i + 1 for i, r in enumerate(lb) if r['id'] == uid), None)
+    stats.update({'id': uid, 'name': u.get('name') or 'Listener', 'joined': u.get('created'),
+                  'rank': rank, 'total_users': len(lb), 'is_me': is_me, 'public': public})
+    return jsonify(stats)
 
 
 # =====================================================================
@@ -3006,8 +6113,6 @@ _OPTS = {'quiet': True, 'no_warnings': True, 'socket_timeout': 30, 'extract_flat
 
 
 def _flat(url, **extra):
-    """Flat (list-only) extraction: ONE request that returns id/title/channel/duration for
-    every entry — it never opens the individual video pages."""
     try:
         with YDL({**_OPTS, **extra}) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -3029,10 +6134,6 @@ def _mk_meta(tags, year, channel, title, duration):
 
 
 def get_meta(vid_, fetch=False, entry=None):
-    """Metadata for a video.
-    Order: in-memory cache -> track_meta sheet -> (only if META_FETCH is enabled AND fetch=True)
-    a full yt-dlp extraction -> the lightweight search-result entry.
-    With the default settings this NEVER makes a network request."""
     if not vid_: return None
     if vid_ in _META: return _META[vid_]
     r = xl_find_one('track_meta', vid=vid_)
@@ -3068,7 +6169,8 @@ def get_meta(vid_, fetch=False, entry=None):
 
 def build_profile(uid, sid):
     now = time.time()
-    ev = [r for r in xl_all('events') if r.get('user_id') == uid]
+    # 'listen' rows are only for stats — keep them out of the recommender
+    ev = [r for r in xl_all('events') if r.get('user_id') == uid and r.get('kind') != 'listen']
     ev.sort(key=lambda r: r.get('ts') or 0, reverse=True)
     ev = ev[:1500]
     lib_rows = [r for r in xl_all('downloads') if r.get('user_id') == uid]
@@ -3204,11 +6306,11 @@ def explain(f, c, cur, kind):
     return why
 
 
-def recommend_next(uid, sid, url, title, exclude, n=12):
+def recommend_next(uid, sid, url, title, exclude, n=15):
     prof = build_profile(uid, sid)
     m_ = VID_RE.search(url or '')
     seed = m_.group(1) if m_ else None
-    client_ex = set(exclude)                      # what the player already has queued
+    client_ex = set(exclude)
     exclude = client_ex | prof['recent'] | {seed or ''}
     base, seed_tok = clean_title(title), tokens(title)
     seed_low = (title or '').lower()
@@ -3224,14 +6326,12 @@ def recommend_next(uid, sid, url, title, exclude, n=12):
     top = [t for t in prof['top'] if t[0] != seed][:6]
     taste = random.sample(top, min(2, len(top)))
 
-    # Seed metadata comes from the cache / search-result info only — no per-video extraction.
     seed_meta = (get_meta(seed, False) if seed else None) or _mk_meta([], None, '', title, 0)
     artist = re.sub(r'(?i)\s*-\s*topic|vevo|official', '', seed_meta['channel']).strip()
     if not artist and ' - ' in (title or ''):
-        artist = clean_title(title.split(' - ', 1)[0])[:60]      # "Artist - Song" titles
+        artist = clean_title(title.split(' - ', 1)[0])[:60]
     tags = [t for t in seed_meta['tags'] if len(t) < 25 and not (tokens(t) & seed_tok)][:3]
 
-    # A handful of FLAT list requests (each returns many candidates in one call).
     with ThreadPoolExecutor(6) as ex:
         f_radio = ex.submit(_flat, f'https://www.youtube.com/watch?v={seed}&list=RD{seed}', playlistend=30) if seed else None
         f_like = ex.submit(_flat, f'ytsearch12:songs like {base}', noplaylist=True)
@@ -3267,9 +6367,6 @@ def recommend_next(uid, sid, url, title, exclude, n=12):
         c['score'] += 25 * (len(c['srcs']) - 1)
         pre.append(c)
     pre.sort(key=lambda c: c['score'], reverse=True)
-    # (removed) the old thread-pool that called get_meta(..., fetch=True) on ~18 candidates —
-    # that was one full yt-dlp extraction per candidate per request. Now every candidate uses
-    # cached metadata or the lightweight search-result entry.
     for c in pre:
         c['m'] = get_meta(c['v'], False, c['e'])
         c['ch'] = c['m']['channel'] or c['e'].get('channel') or c['e'].get('uploader') or ''
@@ -3314,9 +6411,6 @@ def recommend_next(uid, sid, url, title, exclude, n=12):
         picked.append(item)
         prev = c
 
-    # ---- safety net: if the smart ranker found (almost) nothing — e.g. because most
-    #      candidates were filtered as "recently played" — fall back to a plain similar-song
-    #      search so autoplay never dead-ends after a couple of songs.
     if len(picked) < 3:
         try:
             have = {p['id'] for p in picked}
@@ -3354,8 +6448,6 @@ def recommend_next(uid, sid, url, title, exclude, n=12):
 
 @app.route('/api/related')
 def related():
-    # open to guests too (they get half-song previews with autoplay); history-based
-    # personalisation only applies when logged in.
     try:
         exclude = {x for x in request.args.get('exclude', '').split(',') if x}
         uid = g.user['id'] if g.user else -1
@@ -3384,13 +6476,21 @@ if __name__ == '__main__':
     print("\n" + "=" * 50)
     print("🎵 SPOPUDAY - by jhon wilson")
     print("=" * 50)
+    print(f"📂 Data dir: {DATA_DIR}")
     print(f"📁 Downloads: {DOWNLOAD_FOLDER}")
     print(f"🖼️  Covers:    {COVER_FOLDER}")
     print(f"💾 Excel DB: {XLSX_PATH}")
-    print("🌐 Open: http://localhost:5000")
-    print("💡 Dev code mode:", "ON" if LEAK_DEV_CODE else "OFF (set SPOPUDAY_DEV_CODE=1)")
-    print("🍪 YouTube cookies:", YT_COOKIES if (YT_COOKIES and os.path.exists(YT_COOKIES)) else "none")
-    print("🔎 Per-video metadata fetch:", "ON" if META_FETCH else "OFF (set SPOPUDAY_META_FETCH=1)")
+    print(f"🔒 Ban DB:   {BAN_DB_PATH}")
+    print(f"🌐 Open: http://localhost:5000")
+    print(f"💡 Dev code mode:", "ON" if LEAK_DEV_CODE else "OFF (set SPOPUDAY_DEV_CODE=1)")
+    _active_cookies = get_yt_cookies_path()
+    print(f"🍪 YouTube cookies:", _active_cookies if _active_cookies else "none")
+    print(f"🔎 Per-video metadata fetch:", "ON" if META_FETCH else "OFF (set SPOPUDAY_META_FETCH=1)")
+    print(f"📝 Lyrics source: LRCLIB (primary)" + (", YouTube captions (fallback)" if LYRICS_YT_FALLBACK else ""))
+    print(f"🛡️  Rate limits: {GLOBAL_RATE['burst_limit']} req / {GLOBAL_RATE['burst_window']}s  "
+          f"({GLOBAL_RATE['min_limit']} req / {GLOBAL_RATE['min_window']}s)")
+    print(f"🚫 Ban ladder: {BAN_LADDER}")
+    print(f"✅ Whitelisted IPs: {WHITELIST or 'none'}")
     try:
         import socket
         _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); _s.connect(("8.8.8.8", 80))
@@ -3398,4 +6498,5 @@ if __name__ == '__main__':
     except Exception:
         pass
     print("=" * 50 + "\n")
-    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+    _debug = os.environ.get('SPOPUDAY_DEBUG', '0') == '1'
+    app.run(debug=_debug, host='0.0.0.0', port=5000, threaded=True)
