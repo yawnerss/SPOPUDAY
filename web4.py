@@ -99,9 +99,6 @@ def get_deno_path():
     return None
 
 def _setup_deno_runtime():
-    # Cap Deno V8 heap to 128MB to prevent Render 512MB RAM OOM container restarts
-    os.environ['DENO_USE_CGROUPS'] = '1'
-    os.environ['DENO_V8_FLAGS'] = '--max-old-space-size=128'
     deno_bin = get_deno_path()
     if deno_bin:
         deno_dir = os.path.dirname(deno_bin)
@@ -330,14 +327,12 @@ def YDL(opts=None):
         o.setdefault('remote_components', ['ejs:npm'])
 
     # 3. Safe format & playlist defaults
-    # Restrict to YouTube extractors (50x faster init, supports videos, searches & playlists)
-    o.setdefault('allowed_extractors', ['(?i)youtube.*', 'generic'])
     # 'bestaudio/best/18' — itag 18 (360p MP4, combined audio+video) is immune to SABR
     # and never withholds the direct URL, so it works as a last-resort audio source.
     o.setdefault('format', 'bestaudio/best/18')
     o.setdefault('noplaylist', True)
     o.setdefault('ignore_no_formats_error', True)
-    o.setdefault('socket_timeout', 15)
+    o.setdefault('socket_timeout', 30)
 
     ext_args = o.setdefault('extractor_args', {})
     yt_tab = ext_args.setdefault('youtubetab', {})
@@ -5922,23 +5917,22 @@ def stream():
     # Instant playback cache hit (<1ms)
     cached_stream = get_cached_stream_url(video_id)
     if cached_stream:
-        print(f'[Stream] Cache HIT for {video_id} -> instant playback!')
+        print(f'[Stream] Cache HIT for {video_id} -> instant playback!', flush=True)
         return redirect(cached_stream)
 
     deno_bin = DENO_PATH or get_deno_path()
     deno_info = get_deno_info()
     has_cookies = bool(get_yt_cookies_path())
-    print(f'[Stream] Processing video: {video_id} | Deno: {deno_info.get("available")} ({deno_info.get("path") or "none"}) | Cookies: {has_cookies}')
+    print(f'[Stream] Processing video: {video_id} | Deno: {deno_info.get("available")} ({deno_info.get("path") or "none"}) | Cookies: {has_cookies}', flush=True)
 
     ydl_opts = {
         'format': 'bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best/18',
         'quiet': True,
         'no_warnings': True,
-        'socket_timeout': 15,
+        'socket_timeout': 30,
         'noplaylist': True,
         'skip_unavailable_fragments': True,
-        'ignore_no_formats_error': True,
-        'allowed_extractors': ['(?i)youtube.*', 'generic'],
+        'ignore_no_formats_error': True
     }
     if deno_bin:
         ydl_opts['js_runtimes'] = {'deno': {'path': deno_bin}}
@@ -5957,10 +5951,10 @@ def stream():
             direct_urls = [f for f in fmts if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
             audio_formats = [f for f in direct_urls if f.get('acodec') and f.get('acodec') != 'none']
             afmt_summary = [f"{f.get('format_id')}({f.get('ext')}/{f.get('acodec')})" for f in audio_formats[:4]]
-            print(f'[Stream] {video_id} Tier 1: {len(fmts)} formats, {len(direct_urls)} direct URLs, {len(audio_formats)} audio streams {afmt_summary}, resolved={bool(stream_url)}')
+            print(f'[Stream] {video_id} Tier 1: {len(fmts)} formats, {len(direct_urls)} direct URLs, {len(audio_formats)} audio streams {afmt_summary}, resolved={bool(stream_url)}', flush=True)
     except Exception as e:
         last_err = str(e)
-        print(f'[Stream] Tier 1 extraction failed for {video_id}: {last_err[:200]}')
+        print(f'[Stream] Tier 1 extraction failed for {video_id}: {last_err[:200]}', flush=True)
 
     # Tier 2: Resilient fallback targeting tv_samsung & mweb (bypasses GVS PO Token requirement on web_embedded)
     if not stream_url:
@@ -5978,10 +5972,10 @@ def stream():
                 fmts2 = (fallback_info or {}).get('formats') or []
                 direct_urls2 = [f for f in fmts2 if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
                 audio_formats2 = [f for f in direct_urls2 if f.get('acodec') and f.get('acodec') != 'none']
-                print(f'[Stream] {video_id} Tier 2: {len(fmts2)} formats, {len(audio_formats2)} audio streams, resolved={bool(stream_url)}')
+                print(f'[Stream] {video_id} Tier 2: {len(fmts2)} formats, {len(audio_formats2)} audio streams, resolved={bool(stream_url)}', flush=True)
         except Exception as e:
             last_err = str(e)
-            print(f'[Stream] Tier 2 extraction failed for {video_id}: {last_err[:200]}')
+            print(f'[Stream] Tier 2 extraction failed for {video_id}: {last_err[:200]}', flush=True)
 
     # Tier 3: Force itag 18 (360p MP4, combined audio+video) — immune to SABR URL withholding
     if not stream_url:
@@ -6007,10 +6001,10 @@ def stream():
                 fmts3 = (f18_info or {}).get('formats') or []
                 direct_urls3 = [f for f in fmts3 if f.get('url') and not str(f.get('format_id', '')).startswith('sb')]
                 audio_formats3 = [f for f in direct_urls3 if f.get('acodec') and f.get('acodec') != 'none']
-                print(f'[Stream] {video_id} Tier 3 (fmt 18): {len(fmts3)} formats, {len(audio_formats3)} audio streams, resolved={bool(stream_url)}')
+                print(f'[Stream] {video_id} Tier 3 (fmt 18): {len(fmts3)} formats, {len(audio_formats3)} audio streams, resolved={bool(stream_url)}', flush=True)
         except Exception as e:
             last_err = str(e)
-            print(f'[Stream] Tier 3 extraction failed for {video_id}: {last_err[:200]}')
+            print(f'[Stream] Tier 3 extraction failed for {video_id}: {last_err[:200]}', flush=True)
 
     if stream_url:
         set_cached_stream_url(video_id, stream_url)
@@ -6018,7 +6012,7 @@ def stream():
 
     # Diagnostic error reporting without exposing sensitive data
     clean_err = re.sub(r'\x1b\[[0-9;]*m', '', str(last_err or 'No playable audio formats returned by YouTube'))[:300]
-    print(f'❌ [Stream] Extraction failed for {video_id}: {clean_err}')
+    print(f'❌ [Stream] Extraction failed for {video_id}: {clean_err}', flush=True)
 
     if 'failed to extract any player response' in clean_err.lower():
         hint = 'YouTube blocked or did not return a player response for this datacenter IP. Verify that Deno and valid cookies are active.'
@@ -6455,8 +6449,8 @@ def sigmoid(x):
     return 1 / (1 + math.exp(-max(-30, min(30, x))))
 
 
-_OPTS = {'quiet': True, 'no_warnings': True, 'socket_timeout': 15, 'extract_flat': 'in_playlist',
-         'ignoreerrors': True, 'geo_bypass': True, 'allowed_extractors': ['(?i)youtube.*', 'generic']}
+_OPTS = {'quiet': True, 'no_warnings': True, 'socket_timeout': 30, 'extract_flat': 'in_playlist',
+         'ignoreerrors': True, 'geo_bypass': True}
 
 
 def _flat(url, **extra):
